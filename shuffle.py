@@ -886,6 +886,7 @@ console = Console()
 #  API HELPERS  (GraphQL)
 # ===========================================================
 def _headers() -> dict:
+    import uuid
     return {
         "Content-Type":    "application/json",
         "Accept":          "application/graphql-response+json,application/json;q=0.9",
@@ -893,6 +894,7 @@ def _headers() -> dict:
         "Origin":          "https://shuffle.com",
         "Referer":         f"https://shuffle.com/games/originals/{state.game}",
         "User-Agent":      "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36",
+        "x-correlation-id": str(uuid.uuid4()),
     }
 
 def _gql_post(query: str, variables: dict, operation_name: str) -> Optional[dict]:

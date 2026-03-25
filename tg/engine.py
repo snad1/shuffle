@@ -379,6 +379,7 @@ class BettingEngine:
         logger.info("User %d: HTTP session recreated", self.user_id)
 
     def _headers(self) -> dict:
+        import uuid
         return {
             "Content-Type": "application/json",
             "Accept": "*/*",
@@ -389,6 +390,7 @@ class BettingEngine:
                 "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
                 "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36"
             ),
+            "x-correlation-id": str(uuid.uuid4()),
         }
 
     def _gql_post(self, payload: dict) -> Optional[dict]:
