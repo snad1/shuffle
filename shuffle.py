@@ -2531,7 +2531,7 @@ def main():
     if args.setup_only:
         init_db()
         setup_wizard()
-        console.print("[bold green]Config saved.[/] Start with: [cyan]python3 shuffle.py --resume[/] or [cyan]python3 shuffle.py --daemon[/]")
+        console.print("[bold green]Config saved.[/] Start with: [cyan]shufflectl start[/] or [cyan]shufflectl interactive[/]")
         return
 
     init_db()
@@ -2618,8 +2618,8 @@ def main():
     # -- DAEMON MODE --
     if args.daemon:
         console.print(f"[bold green]Daemon started[/]  PID={os.getpid()}  Session #{state.session_id}  Game: {state.game}")
-        console.print(f"[dim]  Check status:  python3 shuffle.py --status[/]")
-        console.print(f"[dim]  Stop:          python3 shuffle.py --stop[/]")
+        console.print(f"[dim]  Check status:  shufflectl status[/]")
+        console.print(f"[dim]  Stop:          shufflectl stop[/]")
         console.print(f"[dim]  Logs:          tail -f ~/.shuffle_logs/shuffle.log[/]")
         try:
             while state.running:
