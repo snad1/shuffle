@@ -31,8 +31,19 @@ except ImportError:
     print("Missing dependencies. Run:  pip install requests rich")
     sys.exit(1)
 
-# Shuffle uses Bearer token auth — no Cloudflare bypass needed
-_http = requests.Session()
+# Try curl_cffi for TLS fingerprint bypass on servers; fall back to requests
+try:
+    from curl_cffi import requests as cffi_requests
+    _HAS_CFFI = True
+except ImportError:
+    _HAS_CFFI = False
+
+def _create_http():
+    if _HAS_CFFI:
+        return cffi_requests.Session(impersonate="chrome")
+    return requests.Session()
+
+_http = _create_http()
 
 # ===========================================================
 #  CONSTANTS
@@ -885,14 +896,28 @@ def _headers() -> dict:
     }
 
 def _gql_post(query: str, variables: dict, operation_name: str) -> Optional[dict]:
-    """Execute a GraphQL mutation/query."""
+    """Execute a GraphQL mutation/query. Retries once on connection reset."""
+    global _http
     payload = {
         "operationName": operation_name,
         "query": query,
         "variables": variables,
         "extensions": {"clientLibrary": {"name": "@apollo/client", "version": "4.1.4"}},
     }
-    r = _http.post(API_URL, headers=_headers(), json=payload, timeout=15)
+    for attempt in range(2):
+        try:
+            r = _http.post(API_URL, headers=_headers(), json=payload, timeout=15)
+            break
+        except (ConnectionError, ConnectionResetError, requests.exceptions.ConnectionError) as e:
+            if attempt == 0:
+                logger.warning("Connection reset — recreating HTTP session and retrying")
+                try:
+                    _http.close()
+                except Exception:
+                    pass
+                _http = _create_http()
+                continue
+            raise ConnectionError(f"Connection failed: {e}")
     if r.status_code != 200:
         body = r.text[:300] if r.text else "(empty)"
         raise ConnectionError(f"HTTP {r.status_code}: {body}")

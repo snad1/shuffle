@@ -26,6 +26,13 @@ from core.database import init_db, db_connect, cleanup_old_bets
 from core.strategy import StrategyRule, load_rules_from_text
 from core.engine import compute_next_bet, apply_action, evaluate_rules
 
+# Try curl_cffi for TLS fingerprint bypass on servers; fall back to requests
+try:
+    from curl_cffi import requests as cffi_requests
+    _HAS_CFFI = True
+except ImportError:
+    _HAS_CFFI = False
+
 import requests
 
 # ── Batching / periodic save constants ──────────────────
@@ -357,7 +364,10 @@ class BettingEngine:
 
     # ── HTTP ─────────────────────────────────────────────
     def _init_http(self):
-        self._http = requests.Session()
+        if _HAS_CFFI:
+            self._http = cffi_requests.Session(impersonate="chrome")
+        else:
+            self._http = requests.Session()
 
     def _recreate_http(self):
         try:
@@ -382,7 +392,16 @@ class BettingEngine:
         }
 
     def _gql_post(self, payload: dict) -> Optional[dict]:
-        r = self._http.post(API_URL, headers=self._headers(), json=payload, timeout=REQUEST_TIMEOUT)
+        for attempt in range(2):
+            try:
+                r = self._http.post(API_URL, headers=self._headers(), json=payload, timeout=REQUEST_TIMEOUT)
+                break
+            except (ConnectionError, ConnectionResetError, requests.exceptions.ConnectionError) as e:
+                if attempt == 0:
+                    logger.warning("User %d: Connection reset — recreating HTTP session", self.user_id)
+                    self._recreate_http()
+                    continue
+                raise ConnectionError(f"Connection failed: {e}")
         if r.status_code != 200:
             body = r.text[:300] if r.text else "(empty)"
             raise ConnectionError(f"HTTP {r.status_code}: {body}")
