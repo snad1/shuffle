@@ -2463,6 +2463,559 @@ def cmd_list_presets():
                       f"{game}/{data.get('currency', '?').upper()} @ {data.get('base_bet', 0):.8f}  "
                       f"{data.get('multiplier_target', 0)}x")
 
+def cmd_last_bets(n: int):
+    """Show last N bets from database."""
+    init_db()
+    if not os.path.exists(DB_PATH):
+        console.print("[yellow]No database found.[/]")
+        return
+    conn = _db_conn()
+    rows = conn.execute("""
+        SELECT b.id, b.session_id, substr(b.timestamp,1,19) AS dt,
+               COALESCE(b.game, 'limbo') AS game,
+               b.amount, b.result_value, COALESCE(b.result_display, '') AS rd,
+               b.state, b.profit, b.balance_after
+        FROM bets b ORDER BY b.id DESC LIMIT ?
+    """, (n,)).fetchall()
+    conn.close()
+
+    if not rows:
+        console.print("[yellow]No bets found.[/]")
+        return
+
+    console.print(Rule(f"[bold cyan]Last {len(rows)} Bets[/]"))
+    t = Table(box=box.SIMPLE, expand=True)
+    t.add_column("Bet",      width=7,  justify="right")
+    t.add_column("Sess",     width=5,  justify="center")
+    t.add_column("DateTime", width=19)
+    t.add_column("Game",     width=6)
+    t.add_column("Amount",   width=14, justify="right")
+    t.add_column("Result",   width=10, justify="right")
+    t.add_column("W/L",      width=4,  justify="center")
+    t.add_column("P/L",      width=15, justify="right")
+    t.add_column("Balance",  width=15, justify="right")
+
+    for r in rows:
+        bid, sid, dt, game, amt, roll, rd, st, pnl, bal = r
+        rc = "bold green" if st == "win" else "bold red"
+        pcc = "green" if (pnl or 0) >= 0 else "red"
+        pss = "+" if (pnl or 0) >= 0 else ""
+        result_str = rd if rd else (f"{roll:.2f}" if roll else "?")
+        game_label = GAMES.get(game, {}).get("label", game or "?")
+        t.add_row(
+            str(bid), str(sid), dt or "?",
+            game_label,
+            f"{amt:.8f}" if amt else "?",
+            result_str,
+            Text("W" if st == "win" else "L", style=rc),
+            Text(f"{pss}{pnl:.8f}" if pnl is not None else "?", style=pcc),
+            f"{bal:.8f}" if bal else "?"
+        )
+    console.print(t)
+    console.print()
+
+
+def _compute_streak_distribution(conn, session_id: int) -> dict:
+    """Compute streak distribution from bets table."""
+    rows = conn.execute(
+        "SELECT state FROM bets WHERE session_id=? ORDER BY id", (session_id,)
+    ).fetchall()
+    dist = {"win": {}, "loss": {}}
+    if not rows:
+        return dist
+    cur_type = None
+    cur_len = 0
+    for (st,) in rows:
+        kind = "win" if st == "win" else "loss"
+        if kind == cur_type:
+            cur_len += 1
+        else:
+            if cur_type and cur_len > 0:
+                dist[cur_type][cur_len] = dist[cur_type].get(cur_len, 0) + 1
+            cur_type = kind
+            cur_len = 1
+    if cur_type and cur_len > 0:
+        dist[cur_type][cur_len] = dist[cur_type].get(cur_len, 0) + 1
+    return dist
+
+
+def cmd_session_bets(session_id: int):
+    """Show full detailed stats and bets for a specific session."""
+    init_db()
+    if not os.path.exists(DB_PATH):
+        console.print("[yellow]No database found.[/]")
+        return
+    conn = _db_conn()
+
+    sess = conn.execute("""
+        SELECT id, started_at, ended_at,
+               UPPER(currency), COALESCE(game, 'limbo'), strategy, base_bet, multiplier,
+               total_bets, wins, losses, profit, wagered,
+               start_balance, end_balance,
+               max_win_streak, max_loss_streak,
+               COALESCE(highest_balance, 0), COALESCE(lowest_balance, 0),
+               COALESCE(highest_win, 0), COALESCE(biggest_loss, 0),
+               COALESCE(bets_per_minute, 0), COALESCE(bets_per_second, 0),
+               COALESCE(peak_bps, 0), COALESCE(low_bps, 0),
+               COALESCE(peak_bpm, 0), COALESCE(low_bpm, 0)
+        FROM sessions WHERE id = ?
+    """, (session_id,)).fetchone()
+
+    if not sess:
+        console.print(f"[red]Session #{session_id} not found.[/]")
+        conn.close()
+        return
+
+    sid, started, ended, cur, game, strat, base, mult, bets, wins, losses, \
+        profit, wagered, start_bal, end_bal, mws, mls, \
+        hi_bal, lo_bal, hi_win, big_loss, \
+        bpm, bps, s_pk_bps, s_lw_bps, s_pk_bpm, s_lw_bpm = sess
+
+    bets = bets or 0; wins = wins or 0; losses = losses or 0
+    profit = profit or 0; wagered = wagered or 0
+    start_bal = start_bal or 0; end_bal = end_bal or 0
+    mws = mws or 0; mls = mls or 0; mult = mult or 0; base = base or 0
+    hi_bal = hi_bal or 0; lo_bal = lo_bal or 0
+    hi_win = hi_win or 0; big_loss = big_loss or 0
+    bpm = bpm or 0; bps = bps or 0
+    s_pk_bps = int(s_pk_bps or 0); s_lw_bps = int(s_lw_bps or 0)
+    s_pk_bpm = int(s_pk_bpm or 0); s_lw_bpm = int(s_lw_bpm or 0)
+
+    pc = "green" if profit >= 0 else "red"
+    ps = "+" if profit >= 0 else ""
+    wr = f"{wins/bets*100:.1f}%" if bets > 0 else "—"
+    avg_pnl = profit / bets if bets > 0 else 0
+    avg_c = "green" if avg_pnl >= 0 else "red"
+    avg_s = "+" if avg_pnl >= 0 else ""
+    game_label = GAMES.get(game, {}).get("label", game or "?")
+
+    uptime_str = "—"
+    try:
+        t0 = datetime.fromisoformat(started) if started else None
+        t1 = datetime.fromisoformat(ended) if ended else datetime.now()
+        if t0:
+            delta = int((t1 - t0).total_seconds())
+            h, rem = divmod(max(delta, 0), 3600)
+            m, s = divmod(rem, 60)
+            uptime_str = f"{h}h {m}m {s}s"
+    except Exception:
+        pass
+
+    console.print(Rule(f"[bold cyan]Session #{sid} — Full Stats[/]"))
+    console.print(f"  [dim]Started:[/]       {(started or '?').replace('T', ' ')}")
+    console.print(f"  [dim]Ended:[/]         {(ended or 'running').replace('T', ' ')}")
+    console.print(f"  [dim]Uptime:[/]        {uptime_str}")
+    console.print(f"  [dim]Game:[/]          {game_label}")
+    console.print(f"  [dim]Currency:[/]      {cur}")
+    console.print(f"  [dim]Strategy:[/]      {strat}  {mult}x  Base: {base:.8f}")
+    console.print(f"  [dim]Bets:[/]          {bets}  [dim]W:[/] [green]{wins}[/]  [dim]L:[/] [red]{losses}[/]  [dim]WR:[/] {wr}")
+    console.print(f"  [dim]Profit:[/]        [{pc}]{ps}{profit:.8f}[/]")
+    console.print(f"  [dim]Wagered:[/]       {wagered:.8f}")
+    console.print(f"  [dim]Avg P/L:[/]       [{avg_c}]{avg_s}{avg_pnl:.8f}[/] per bet")
+    console.print(f"  [dim]Balance:[/]       {start_bal:.8f} -> {end_bal:.8f}")
+    console.print(f"  [dim]Peak / Low:[/]    [green]{hi_bal:.8f}[/] / [red]{lo_bal:.8f}[/]")
+    console.print(f"  [dim]Best Streaks:[/]  W+{mws}  L-{mls}")
+    console.print(f"  [dim]Best Win:[/]      [green]+{hi_win:.8f}[/]")
+    console.print(f"  [dim]Worst Loss:[/]    [red]-{big_loss:.8f}[/]")
+    console.print(f"  [dim]Speed:[/]         {bps:.1f} avg/s  {bpm:.0f} avg/m  Range: {s_lw_bps}-{s_pk_bps}/s  {s_lw_bpm}-{s_pk_bpm}/m")
+
+    console.print()
+    console.print(Rule("[bold cyan]Streak Distribution[/]"))
+
+    dist = _compute_streak_distribution(conn, session_id)
+
+    loss_dist = dist["loss"]
+    if loss_dist:
+        console.print(f"  [bold red]Loss Streaks[/]  (how many times each streak length occurred)")
+        t_loss = Table(box=box.SIMPLE, show_edge=False, padding=(0, 2))
+        t_loss.add_column("Streak", style="bold red", justify="right")
+        t_loss.add_column("Count", justify="right")
+        t_loss.add_column("", width=30)
+        max_count = max(loss_dist.values()) if loss_dist else 1
+        for length in sorted(loss_dist.keys()):
+            count = loss_dist[length]
+            bar_w = int(count / max_count * 25)
+            bar = "[red]" + "\u2588" * bar_w + "[/]"
+            t_loss.add_row(f"L-{length}", str(count), bar)
+        console.print(t_loss)
+    else:
+        console.print("  [dim]No loss streaks recorded[/]")
+
+    console.print()
+
+    win_dist = dist["win"]
+    if win_dist:
+        console.print(f"  [bold green]Win Streaks[/]  (how many times each streak length occurred)")
+        t_win = Table(box=box.SIMPLE, show_edge=False, padding=(0, 2))
+        t_win.add_column("Streak", style="bold green", justify="right")
+        t_win.add_column("Count", justify="right")
+        t_win.add_column("", width=30)
+        max_count = max(win_dist.values()) if win_dist else 1
+        for length in sorted(win_dist.keys()):
+            count = win_dist[length]
+            bar_w = int(count / max_count * 25)
+            bar = "[green]" + "\u2588" * bar_w + "[/]"
+            t_win.add_row(f"W+{length}", str(count), bar)
+        console.print(t_win)
+    else:
+        console.print("  [dim]No win streaks recorded[/]")
+
+    rows = conn.execute("""
+        SELECT id, substr(timestamp,12,8), COALESCE(game, 'limbo'),
+               amount, result_value, COALESCE(result_display, ''),
+               state, profit, balance_after
+        FROM bets WHERE session_id = ? ORDER BY id DESC LIMIT 50
+    """, (session_id,)).fetchall()
+    conn.close()
+
+    if rows:
+        console.print()
+        console.print(Rule(f"[bold cyan]Last {len(rows)} Bets[/]"))
+        t = Table(box=box.SIMPLE, expand=True)
+        t.add_column("Bet",     width=7, justify="right")
+        t.add_column("Time",    width=9)
+        t.add_column("Game",    width=6)
+        t.add_column("Amount",  width=14, justify="right")
+        t.add_column("Result",  width=10, justify="right")
+        t.add_column("W/L",     width=4, justify="center")
+        t.add_column("P/L",     width=15, justify="right")
+        t.add_column("Balance", width=15, justify="right")
+
+        for r in rows:
+            bid, tm, g, amt, roll, rd, st, pnl, bal = r
+            rc = "bold green" if st == "win" else "bold red"
+            pcc = "green" if (pnl or 0) >= 0 else "red"
+            pss = "+" if (pnl or 0) >= 0 else ""
+            result_str = rd if rd else (f"{roll:.2f}" if roll else "?")
+            gl = GAMES.get(g, {}).get("label", g or "?")
+            t.add_row(
+                str(bid), tm or "?",
+                gl,
+                f"{amt:.8f}" if amt else "?",
+                result_str,
+                Text("W" if st == "win" else "L", style=rc),
+                Text(f"{pss}{pnl:.8f}" if pnl is not None else "?", style=pcc),
+                f"{bal:.8f}" if bal else "?"
+            )
+        console.print(t)
+    console.print()
+
+
+# ── cmd_monitor ───────────────────────────────────────────
+def _monitor_read_state():
+    """Read daemon state file and return dict, or None if not running."""
+    if not os.path.exists(STATE_PATH):
+        return None
+    try:
+        with open(STATE_PATH) as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+def _monitor_get_pid(d: dict) -> int:
+    """Get daemon PID and verify it's alive."""
+    pid = d.get("pid", 0)
+    if pid:
+        try:
+            os.kill(pid, 0)
+            return pid
+        except OSError:
+            pass
+    return 0
+
+def _monitor_get_recent_bets(session_id: int, limit: int) -> list:
+    """Fetch recent bets from DB for the monitor view."""
+    if not os.path.exists(DB_PATH):
+        return []
+    try:
+        conn = _db_conn()
+        rows = conn.execute("""
+            SELECT id, substr(timestamp,1,19), COALESCE(game, 'limbo'),
+                   amount, result_value, COALESCE(result_display, ''),
+                   state, profit, balance_after
+            FROM bets WHERE session_id=? ORDER BY id DESC LIMIT ?
+        """, (session_id, limit)).fetchall()
+        conn.close()
+        result = []
+        for r in rows:
+            result.append({
+                "n": r[0], "time": (r[1] or "")[11:19],
+                "game": r[2] or "limbo",
+                "amt": r[3] or 0, "roll": r[4] or 0,
+                "rd": r[5] or "",
+                "state": r[6] or "lose", "pnl": r[7] or 0,
+                "bal": r[8] or 0,
+            })
+        return result
+    except Exception:
+        return []
+
+def _build_monitor_screen(d: dict, bets: list, pid_alive: bool) -> str:
+    """Build full-screen ANSI dashboard from state dict + bet list."""
+    try:
+        term_size = os.get_terminal_size()
+        term_h = term_size.lines
+        term_w = term_size.columns
+    except OSError:
+        term_h, term_w = 24, 80
+
+    lines = []
+    def add(s: str):
+        lines.append(f"{s}{_CLR_EOL}")
+    def add_blank():
+        lines.append(_CLR_EOL)
+
+    sid       = d.get("session_id", "?")
+    uptime    = str(timedelta(seconds=d.get("uptime_sec", 0)))
+    currency  = d.get("currency", "?").upper()
+    strategy  = d.get("strategy", "?")
+    mult      = d.get("multiplier_target", 0)
+    game      = d.get("game", "limbo")
+    base_bet  = d.get("base_bet", 0)
+    cur_bet   = d.get("current_bet", 0)
+    hi_bet    = d.get("highest_bet", 0)
+    bal       = d.get("current_balance", 0)
+    start_bal = d.get("start_balance", 0)
+    profit    = d.get("profit", 0)
+    wagered   = d.get("wagered", 0)
+    total     = d.get("total_bets", 0)
+    wins      = d.get("wins", 0)
+    losses    = d.get("losses", 0)
+    cs        = d.get("current_streak", 0)
+    mws       = d.get("max_win_streak", 0)
+    mls       = d.get("max_loss_streak", 0)
+    hi_bal    = d.get("highest_balance", 0) or bal
+    lo_bal    = d.get("lowest_balance", 0) or bal
+    hi_win    = d.get("highest_win", 0)
+    big_loss  = d.get("biggest_loss", 0)
+    bps       = d.get("bets_per_second", 0)
+    bpm       = d.get("bets_per_minute", 0)
+    pk_bps    = int(d.get("peak_bps", 0))
+    lw_bps    = int(d.get("low_bps", 0))
+    pk_bpm    = int(d.get("peak_bpm", 0))
+    lw_bpm    = int(d.get("low_bpm", 0))
+    paused    = d.get("paused", False)
+    status    = d.get("status", "")
+
+    game_label = GAMES.get(game, {}).get("label", game)
+    if game == "dice":
+        game_info = f"Dice {d.get('dice_condition', 'above')} {d.get('dice_target', 50.5)}  {mult}x"
+    else:
+        game_info = f"Limbo {mult}x target"
+
+    if pid_alive and not paused:
+        st_ind = _a("bold_green", "* LIVE")
+    elif pid_alive and paused:
+        st_ind = _a("bold_yellow", "* PAUSED")
+    else:
+        st_ind = _a("bold_red", "* STOPPED")
+
+    add(f"{_a('dim_magenta', '--- ')}{_a('bold_cyan', f'Shuffle v{VERSION}')}"
+        f"{_a('white', f'  #{sid}  {uptime}')}  {st_ind} "
+        f"{_a('dim', f'  {game_info}')}"
+        f"{_a('dim_magenta', ' ' + '-' * max(0, term_w - 80))}")
+
+    ps = "+" if profit >= 0 else ""
+    pc = "bold_green" if profit >= 0 else "bold_red"
+    wr = (wins / total * 100) if total else 0
+    wr_c = "bold_green" if wr >= 50 else "bold_red"
+    add(f"{_COLORS['bg_magenta']}{_BOLD}{_COLORS['white']} BAL {_RST} "
+        f"{_a('bold_white', f'{bal:.8f} {currency}')}"
+        f"  {_a('dim', 'PnL')} {_a(pc, f'{ps}{profit:.8f}')}"
+        f"  {_a('dim', 'WAG')} {_a('yellow', f'{wagered:.8f}')}"
+        f"  {_a('dim', 'WR')} {_a(wr_c, f'{wr:.1f}%')}")
+
+    if cs > 0:
+        sk = _a("green", f"W+{cs}")
+    elif cs < 0:
+        sk = _a("red", f"L{cs}")
+    else:
+        sk = _a("dim", "--")
+    add(f" {_a('dim', 'Bets')} {_a('bold_white', str(total))}"
+        f"  {_a('green', 'W')} {_a('bold_green', str(wins))}"
+        f"  {_a('red', 'L')} {_a('bold_red', str(losses))}"
+        f"  {_a('dim', 'Str')} {sk}"
+        f"  {_a('dim', f'Best W+{mws}/L-{mls}')}")
+
+    s4 = f" {_a('dim', 'Bet')} {_a('yellow', f'{cur_bet:.8f}')}"
+    s4 += f"  {_a('dim', 'Base')} {_a('bold_green', f'{base_bet:.8f}')}"
+    s4 += (f"  {_a('dim', 'Hi')} {_a('white', f'{hi_bet:.8f}')}"
+           f"  {_a('cyan', strategy)}"
+           f"  {_a('dim', f'{mult}x')}"
+           f"  {_a('dim', 'BPS')} {_a('magenta', f'{bps:.1f}')}"
+           f"  {_a('dim', 'BPM')} {_a('magenta', f'{bpm:.0f}')}"
+           f"  {_a('dim', 'Speed')} {_a('magenta', f'{lw_bps}-{pk_bps}/s {lw_bpm}-{pk_bpm}/m')}")
+    add(s4)
+
+    avg_pnl = profit / total if total else 0
+    avg_c = "green" if avg_pnl >= 0 else "red"
+    avg_s = "+" if avg_pnl >= 0 else ""
+    bal_change = bal - start_bal
+    bc_c = "bold_green" if bal_change >= 0 else "bold_red"
+    bc_s = "+" if bal_change >= 0 else ""
+    s5 = (f" {_a('dim', 'Peak')} {_a('green', f'{hi_bal:.8f}')}"
+          f"  {_a('dim', 'Low')} {_a('red', f'{lo_bal:.8f}')}"
+          f"  {_a('dim', 'BestW')} {_a('green', f'+{hi_win:.8f}')}"
+          f"  {_a('dim', 'WorstL')} {_a('red', f'-{big_loss:.8f}')}"
+          f"  {_a('dim', 'Avg')} {_a(avg_c, f'{avg_s}{avg_pnl:.8f}')}"
+          f"  {_a('dim', 'Bal')} {_a(bc_c, f'{bc_s}{bal_change:.8f}')}")
+    add(s5)
+
+    add(f" {_a('dim', 'P/L')} {_a('dim', '—')}")
+
+    add(_a("dim_magenta", "-" * term_w))
+
+    add(_a("dim", f"{'#':>6}  {'Time':<9} {'Game':<6} {'Amount':>14}  {'Result':>10}  {'W/L':^4}  {'P/L':>15}  {'Balance':>15}"))
+
+    bets_avail = max(0, term_h - 10)
+    shown = bets[:bets_avail]
+
+    for b in shown:
+        bn = b["n"]
+        btm = b["time"]
+        bgame = GAMES.get(b["game"], {}).get("label", b["game"])[:6]
+        bamt = b["amt"]
+        broll = b["roll"]
+        brd = b["rd"]
+        bpnl = b["pnl"]
+        bbal = b["bal"]
+        bwl_c = "bold_green" if b["state"] == "win" else "bold_red"
+        bwl_t = " W " if b["state"] == "win" else " L "
+        bpnl_c = "green" if bpnl >= 0 else "red"
+        bsign = "+" if bpnl >= 0 else ""
+        result_str = brd if brd else f"{broll:>10.2f}"
+        add(f"{_a('dim', f'{bn:>6}')}"
+            f"  {_a('dim', f'{btm:<9}')}"
+            f" {_a('dim', f'{bgame:<6}')}"
+            f" {_a('white', f'{bamt:>14.8f}')}"
+            f"  {_a('white', f'{result_str:>10}')}"
+            f"  {_a(bwl_c, bwl_t)}"
+            f"  {_a(bpnl_c, f'{bsign}{bpnl:>14.8f}')}"
+            f"  {_a('white', f'{bbal:>14.8f}')}")
+
+    for _ in range(bets_avail - len(shown)):
+        add_blank()
+
+    add(_a("dim_magenta", "-" * term_w))
+
+    status_txt = status[:60] if status else "Monitoring..."
+    keys = "[P]ause [R]esume [Q]uit/Detach [S]top daemon"
+    add(f" {_a('bold_white', 'MONITOR')} {_a('white', status_txt)}  {_a('dim', keys)}")
+
+    return "\r\n".join(lines)
+
+
+def cmd_monitor():
+    """Attach a live TUI viewer to a running daemon session."""
+    d = _monitor_read_state()
+    if not d:
+        console.print("[yellow]No running session found. Start with: shufflectl start[/]")
+        return
+    pid = _monitor_get_pid(d)
+    if not pid:
+        console.print("[yellow]Daemon not running (stale state file).[/]")
+        return
+
+    sid = d.get("session_id", 0)
+    console.print(f"[dim]Attaching to session #{sid} (PID {pid})... Press Q to detach.[/]")
+    time.sleep(0.5)
+
+    _old_term = None
+    try:
+        import termios
+        _old_term = termios.tcgetattr(sys.stdin.fileno())
+    except Exception:
+        pass
+
+    sys.stdout.write("\033[?1049h\033[?25l")
+    sys.stdout.flush()
+
+    _monitor_running = [True]
+    _monitor_action = [None]
+
+    def _monitor_keys():
+        while _monitor_running[0]:
+            try:
+                import termios as _t, tty as _tty
+                fd = sys.stdin.fileno()
+                old = _t.tcgetattr(fd)
+                try:
+                    _tty.setraw(fd)
+                    ch = sys.stdin.read(1).lower()
+                finally:
+                    _t.tcsetattr(fd, _t.TCSADRAIN, old)
+                if ch in ("q", "\x03", "\x1c"):
+                    _monitor_action[0] = "quit"
+                    _monitor_running[0] = False
+                elif ch == "p":
+                    _monitor_action[0] = "pause"
+                elif ch == "r":
+                    _monitor_action[0] = "resume"
+                elif ch == "s":
+                    _monitor_action[0] = "stop"
+                    _monitor_running[0] = False
+            except Exception:
+                time.sleep(0.1)
+
+    t_keys = threading.Thread(target=_monitor_keys, daemon=True)
+    t_keys.start()
+
+    try:
+        while _monitor_running[0]:
+            action = _monitor_action[0]
+            _monitor_action[0] = None
+            if action == "pause" and pid:
+                try:
+                    os.kill(pid, signal.SIGUSR1)
+                except OSError:
+                    pass
+            elif action == "resume" and pid:
+                try:
+                    os.kill(pid, signal.SIGUSR2)
+                except OSError:
+                    pass
+
+            d = _monitor_read_state()
+            if not d:
+                break
+            pid = _monitor_get_pid(d)
+
+            bet_limit = max(0, (os.get_terminal_size().lines if sys.stdout.isatty() else 24) - 10)
+            recent_bets = _monitor_get_recent_bets(sid, bet_limit)
+
+            sys.stdout.write("\033[H")
+            sys.stdout.write(_build_monitor_screen(d, recent_bets, bool(pid)))
+            sys.stdout.flush()
+            time.sleep(0.5)
+
+        if _monitor_action[0] == "stop" or (locals().get("action") == "stop"):
+            if pid:
+                try:
+                    os.kill(pid, signal.SIGTERM)
+                except OSError:
+                    pass
+    finally:
+        _monitor_running[0] = False
+        sys.stdout.write("\033[?25h\033[?1049l\033[0m")
+        sys.stdout.flush()
+        if _old_term is not None:
+            try:
+                import termios
+                termios.tcsetattr(sys.stdin.fileno(), termios.TCSAFLUSH, _old_term)
+            except Exception:
+                pass
+        import subprocess
+        try:
+            subprocess.run(["stty", "sane"], stdin=sys.stdin, check=False)
+        except Exception:
+            pass
+
+    if _monitor_action[0] == "stop":
+        console.print("[bold red]Daemon stopped.[/]")
+    else:
+        console.print("[dim]Detached from monitor. Daemon continues running.[/]")
+
+
 # ===========================================================
 #  MAIN
 # ===========================================================
@@ -2502,6 +3055,8 @@ def main():
     group.add_argument("--stop",    action="store_true", help="Stop a running daemon session")
     group.add_argument("--list-presets", action="store_true", help="List saved presets")
     group.add_argument("--stats",   action="store_true", help="Show all-time session statistics")
+    group.add_argument("--last-bets", type=int, metavar="N", help="Show last N bets from database")
+    group.add_argument("--session-bets", type=int, metavar="ID", help="Show bets for a specific session")
     parser.add_argument("--preset", type=str, metavar="NAME",
                         help="Load a named preset and start (skips wizard)")
     parser.add_argument("--verbose", action="store_true",
@@ -2526,6 +3081,15 @@ def main():
         return
     if args.stats:
         cmd_stats()
+        return
+    if args.monitor:
+        cmd_monitor()
+        return
+    if args.last_bets:
+        cmd_last_bets(args.last_bets)
+        return
+    if args.session_bets is not None:
+        cmd_session_bets(args.session_bets)
         return
 
     if args.setup_only:
