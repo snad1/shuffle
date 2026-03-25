@@ -1,0 +1,4 @@
+requests
+rich
+python-telegram-bot>=20.0
+python-jose[cryptography]>=3.3.0
