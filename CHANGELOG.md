@@ -1,5 +1,25 @@
 # Changelog
 
+## v1.0.1 — Stats, Status & Ops Improvements (2026-03-26)
+
+### CLI Bot v1.0.1
+
+#### Added
+
+- **Enhanced `cmd_stats()`** — Full per-session details: speed (BPS/BPM peak/low), balance extremes, total wagered, uptime; plus an all-time totals section across all sessions
+- **Enhanced `cmd_status()`** — Full session details: strategy, stop conditions, rules, speed ranges, and 30 session metrics
+- **`shufflectl start-all / stop-all / status-all`** — Batch commands to start, stop, or check status of all managed services at once
+
+#### Security
+
+- **`_save_state_file()` permissions** — State files are now written with `0o600` permissions, preventing other users from reading session state
+
+### Infrastructure v1.0.1
+
+- **`run-tg.sh` helper** — Added to `install.sh` for launching the Telegram bot process directly
+
+---
+
 ## v1.0.0 — Initial Release (2026-03-25)
 
 ### CLI Bot v1.0.0
