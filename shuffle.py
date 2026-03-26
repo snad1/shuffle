@@ -967,21 +967,12 @@ def api_get_balances() -> list:
     return []
 
 def api_test_connection() -> bool:
-    """Test auth with a zero-bet."""
-    game_info = GAMES[state.game]
-    build = game_info["build_query"]
-    response_key = game_info["response_key"]
-
-    saved_bet = state.current_bet
-    state.current_bet = 0
-    query, variables = build(state)
-    state.current_bet = saved_bet
-
+    """Test auth by fetching the user profile (read-only, no bet placed)."""
     try:
-        data = _gql_post(query, variables, game_info["operation_name"])
-        if response_key in data:
+        balances = api_get_balances()
+        if isinstance(balances, list):
             return True
-        raise Exception(f"Missing {response_key} in response")
+        raise Exception("Unexpected response from profile query")
     except Exception as e:
         raise Exception(f"Connection failed: {e}")
 
@@ -2134,7 +2125,7 @@ def setup_wizard():
         state.game = game_keys[int(v) - 1]
 
         # Test connection with this game
-        console.print(f"  [dim]Testing connection ({GAMES[state.game]['label']}, zero-bet)...[/]")
+        console.print(f"  [dim]Testing connection ({GAMES[state.game]['label']})...[/]")
         try:
             api_test_connection()
             console.print("[green]  Connected![/]\n")
