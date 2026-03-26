@@ -4,6 +4,7 @@ import os
 import logging
 
 # ── Environment ──────────────────────────────────────────
+APP_ENV   = os.environ.get("APP_ENV", "production")
 BOT_TOKEN = os.environ.get("SHUFFLE_TG_TOKEN", "")
 DATA_DIR  = os.environ.get("SHUFFLE_TG_DATA", os.path.expanduser("~/.shufflebot_tg"))
 WEB_URL   = os.environ.get("SHUFFLE_WEB_URL", "")          # e.g. http://IP:8001
