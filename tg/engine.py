@@ -157,7 +157,7 @@ def _limbo_build(engine):
     }
 
 
-def _limbo_parse(data):
+def _limbo_parse(data, engine=None):
     limbo_data = data.get("limbo", data)
     payout_mult = float(limbo_data.get("payoutMultiplier", 0))
     amount = float(limbo_data.get("amount", 0))
@@ -172,13 +172,16 @@ def _limbo_parse(data):
         limbo_inner = action.get("limbo", {})
         result = float(limbo_inner.get("result", 0))
 
+    target = engine.multiplier_target if engine else 0
+    is_win = result >= target if target > 0 else payout_mult > 0
+
     return {
         "amount": amount,
         "payout": payout,
         "payout_mult": payout_mult,
         "result_display": f"{result:.4f}x",
         "result_value": result,
-        "is_win": payout_mult > 0,
+        "is_win": is_win,
         "after_balance": float(after_balance) if after_balance is not None else None,
     }
 
@@ -198,7 +201,7 @@ def _dice_build(engine):
     }
 
 
-def _dice_parse(data):
+def _dice_parse(data, engine=None):
     dice_data = data.get("dice", data)
     payout_mult = float(dice_data.get("payoutMultiplier", 0))
     amount = float(dice_data.get("amount", 0))
@@ -206,11 +209,20 @@ def _dice_parse(data):
     after_balance = dice_data.get("afterBalance")
 
     result = 0.0
+    target = 0.0
+    condition = ""
     actions = dice_data.get("shuffleOriginalActions", [])
     if actions:
         action = actions[0].get("action", {})
         dice_inner = action.get("dice", {})
         result = float(dice_inner.get("result", 0))
+        target = float(dice_inner.get("target", 0))
+        condition = dice_inner.get("condition", "")
+
+    if condition and target > 0:
+        is_win = result > target if condition.lower() == "above" else result < target
+    else:
+        is_win = payout_mult > 0
 
     return {
         "amount": amount,
@@ -218,7 +230,7 @@ def _dice_parse(data):
         "payout_mult": payout_mult,
         "result_display": f"{result:.2f}",
         "result_value": result,
-        "is_win": payout_mult > 0,
+        "is_win": is_win,
         "after_balance": float(after_balance) if after_balance is not None else None,
     }
 
@@ -503,7 +515,7 @@ class BettingEngine:
 
             self._api_ms_total += self._last_api_ms
             self._api_ms_count += 1
-            return parse(raw)
+            return parse(raw, self)
         except ConnectionError as e:
             err = str(e)
             if "429" in err:

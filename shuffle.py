@@ -156,7 +156,7 @@ def _limbo_parse(data):
         limbo_action = actions[0].get("action", {}).get("limbo", {})
         result_value = float(limbo_action.get("resultValue", 0))
         user_value = float(limbo_action.get("userValue", 0))
-    is_win = payout > 0
+    is_win = result_value >= user_value if user_value > 0 else payout > 0
     payout_mult = result_value if is_win else 0.0
     return {
         "amount": amount,
@@ -230,7 +230,11 @@ def _dice_parse(data):
         result_value = float(dice_action.get("resultValue", 0))
         user_value = dice_action.get("userValue", "")
         direction = dice_action.get("userDiceDirection", "")
-    is_win = payout > 0
+    if direction and user_value:
+        uv = float(user_value)
+        is_win = result_value > uv if direction == "ABOVE" else result_value < uv
+    else:
+        is_win = payout > 0
     payout_mult = 0.0
     if is_win and amount > 0:
         payout_mult = payout / amount
