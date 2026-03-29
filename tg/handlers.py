@@ -198,7 +198,10 @@ async def cmd_settoken(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     user_id = update.effective_user.id
     config = load_user_config(user_id)
-    config["bearer_token"] = context.args[0]
+    token = " ".join(context.args).strip()
+    if token.lower().startswith("bearer "):
+        token = token[7:].strip()
+    config["bearer_token"] = token
     save_user_config(user_id, config)
 
     await update.effective_chat.send_message(
