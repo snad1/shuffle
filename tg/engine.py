@@ -48,16 +48,20 @@ def _gen_window_id() -> str:
 
 
 # ── GraphQL queries / mutations ──────────────────────────
-_LIMBO_QUERY = """mutation LimboPlay($amount: Float!, $bet: Float!, $currency: String!, $windowId: String!, $usdAmount: Float) {
-  limbo(amount: $amount, bet: $bet, currency: $currency, windowId: $windowId, usdAmount: $usdAmount) {
-    ...CasinoGameFields
+_LIMBO_QUERY = """mutation LimboPlay($data: LimboPlayInput!) {
+  limboPlay(data: $data) {
+    id
+    currency
+    amount
+    payout
+    afterBalance
     shuffleOriginalActions {
+      id
       action {
-        ... on CasinoGameLimbo {
-          limbo {
-            result
-            __typename
-          }
+        limbo {
+          resultRaw
+          resultValue
+          userValue
           __typename
         }
         __typename
@@ -66,61 +70,33 @@ _LIMBO_QUERY = """mutation LimboPlay($amount: Float!, $bet: Float!, $currency: S
     }
     __typename
   }
-}
-
-fragment CasinoGameFields on CasinoGame {
-  id
-  active
-  payoutMultiplier
-  amountMultiplier
-  amount
-  payout
-  updatedAt
-  currency
-  game
-  afterBalance
-  __typename
 }"""
 
-_DICE_QUERY = """mutation DicePlay($amount: Float!, $bet: Float!, $currency: String!, $direction: String!, $usdAmount: Float) {
-  dice(amount: $amount, bet: $bet, currency: $currency, direction: $direction, usdAmount: $usdAmount) {
-    ...CasinoGameFields
+_DICE_QUERY = """mutation DicePlay($data: DicePlayInput!) {
+  dicePlay(data: $data) {
+    id
+    currency
+    amount
+    payout
+    afterBalance
     shuffleOriginalActions {
+      id
       action {
-        ... on CasinoGameDice {
-          dice {
-            ...DiceFields
-            __typename
-          }
+        dice {
+          userDiceDirection
+          userValue
+          resultValue
+          resultRaw
           __typename
         }
         __typename
       }
       __typename
     }
+    updatedAt
+    createdAt
     __typename
   }
-}
-
-fragment CasinoGameFields on CasinoGame {
-  id
-  active
-  payoutMultiplier
-  amountMultiplier
-  amount
-  payout
-  updatedAt
-  currency
-  game
-  afterBalance
-  __typename
-}
-
-fragment DiceFields on Dice {
-  result
-  target
-  condition
-  __typename
 }"""
 
 _BALANCE_QUERY = """query GetMyProfile {
@@ -145,103 +121,103 @@ def _limbo_build(engine):
         "operationName": "LimboPlay",
         "query": _LIMBO_QUERY,
         "variables": {
-            "amount": round(engine.current_bet, 8) if engine.current_bet >= MIN_BET else engine.current_bet,
-            "bet": engine.multiplier_target,
-            "currency": engine.currency,
-            "windowId": _gen_window_id(),
-            "usdAmount": 0,
+            "data": {
+                "amount": f"{engine.current_bet:.8f}",
+                "bet": f"{engine.multiplier_target:.2f}",
+                "currency": engine.currency.upper(),
+                "windowId": _gen_window_id(),
+                "usdAmount": 0,
+            }
         },
     }
 
 
 def _limbo_parse(data, engine=None):
-    limbo_data = data.get("limbo", data)
-    payout_mult = float(limbo_data.get("payoutMultiplier", 0))
-    amount = float(limbo_data.get("amount", 0))
-    payout = float(limbo_data.get("payout", 0))
-    after_balance = limbo_data.get("afterBalance")
-
-    # Get result from nested shuffleOriginalActions
-    result = 0.0
-    actions = limbo_data.get("shuffleOriginalActions", [])
+    bet_data = data.get("limboPlay", data)
+    amount = float(bet_data.get("amount", 0))
+    payout = float(bet_data.get("payout", 0))
+    after_balance = float(bet_data.get("afterBalance", 0))
+    actions = bet_data.get("shuffleOriginalActions", [])
+    result_value = 0.0
+    user_value = 0.0
     if actions:
-        action = actions[0].get("action", {})
-        limbo_inner = action.get("limbo", {})
-        result = float(limbo_inner.get("result", 0))
-
-    target = engine.multiplier_target if engine else 0
-    is_win = result >= target if target > 0 else payout_mult > 0
+        limbo_action = actions[0].get("action", {}).get("limbo", {})
+        result_value = float(limbo_action.get("resultValue", 0))
+        user_value = float(limbo_action.get("userValue", 0))
+    is_win = result_value >= user_value if user_value > 0 else payout > 0
+    payout_mult = result_value if is_win else 0.0
 
     return {
         "amount": amount,
         "payout": payout,
         "payout_mult": payout_mult,
-        "result_display": f"{result:.4f}x",
-        "result_value": result,
+        "result_display": f"{result_value:.4f}x",
+        "result_value": result_value,
         "is_win": is_win,
-        "after_balance": float(after_balance) if after_balance is not None else None,
+        "after_balance": after_balance,
     }
 
 
 def _dice_build(engine):
-    direction = "ABOVE" if engine.dice_condition == "above" else "BELOW"
     return {
         "operationName": "DicePlay",
         "query": _DICE_QUERY,
         "variables": {
-            "amount": round(engine.current_bet, 8) if engine.current_bet >= MIN_BET else engine.current_bet,
-            "bet": engine.dice_target,
-            "currency": engine.currency,
-            "direction": direction,
-            "usdAmount": 0,
+            "data": {
+                "amount": f"{engine.current_bet:.8f}",
+                "bet": f"{engine.dice_target:.2f}",
+                "currency": engine.currency.upper(),
+                "direction": engine.dice_condition.upper(),
+                "usdAmount": 0,
+            }
         },
     }
 
 
 def _dice_parse(data, engine=None):
-    dice_data = data.get("dice", data)
-    payout_mult = float(dice_data.get("payoutMultiplier", 0))
-    amount = float(dice_data.get("amount", 0))
-    payout = float(dice_data.get("payout", 0))
-    after_balance = dice_data.get("afterBalance")
-
-    result = 0.0
-    target = 0.0
-    condition = ""
-    actions = dice_data.get("shuffleOriginalActions", [])
+    bet_data = data.get("dicePlay", data)
+    amount = float(bet_data.get("amount", 0))
+    payout = float(bet_data.get("payout", 0))
+    after_balance = float(bet_data.get("afterBalance", 0))
+    actions = bet_data.get("shuffleOriginalActions", [])
+    result_value = 0.0
+    user_value = ""
+    direction = ""
     if actions:
-        action = actions[0].get("action", {})
-        dice_inner = action.get("dice", {})
-        result = float(dice_inner.get("result", 0))
-        target = float(dice_inner.get("target", 0))
-        condition = dice_inner.get("condition", "")
-
-    if condition and target > 0:
-        is_win = result > target if condition.lower() == "above" else result < target
+        dice_action = actions[0].get("action", {}).get("dice", {})
+        result_value = float(dice_action.get("resultValue", 0))
+        user_value = dice_action.get("userValue", "")
+        direction = dice_action.get("userDiceDirection", "")
+    if direction and user_value:
+        uv = float(user_value)
+        is_win = result_value > uv if direction == "ABOVE" else result_value < uv
     else:
-        is_win = payout_mult > 0
+        is_win = payout > 0
+    payout_mult = 0.0
+    if is_win and amount > 0:
+        payout_mult = payout / amount
 
     return {
         "amount": amount,
         "payout": payout,
         "payout_mult": payout_mult,
-        "result_display": f"{result:.2f}",
-        "result_value": result,
+        "result_display": f"{result_value:.2f}",
+        "result_value": result_value,
         "is_win": is_win,
-        "after_balance": float(after_balance) if after_balance is not None else None,
+        "after_balance": after_balance,
     }
 
 
 GAMES = {
     "limbo": {
         "label": "Limbo",
-        "response_key": "limbo",
+        "response_key": "limboPlay",
         "build_payload": _limbo_build,
         "parse_result": _limbo_parse,
     },
     "dice": {
         "label": "Dice",
-        "response_key": "dice",
+        "response_key": "dicePlay",
         "build_payload": _dice_build,
         "parse_result": _dice_parse,
     },
