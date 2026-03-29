@@ -857,6 +857,7 @@ class BotState:
         self.backoff_delay   = 1.0
         self.max_backoff     = 30.0
         self.consecutive_errors = 0
+        self._insufficient_balance = False
 
         # -- performance --
         self.bets_per_minute = 0.0
@@ -1023,6 +1024,7 @@ def api_place_bet(amount: float) -> Optional[dict]:
             logger.warning("INSUFFICIENT BALANCE")
             with state.lock:
                 state.last_error = "Insufficient balance"
+                state._insufficient_balance = True
         else:
             logger.error("API error: %s", err)
             with state.lock:
@@ -1121,6 +1123,11 @@ def betting_loop():
         result = api_place_bet(state.current_bet)
 
         if result is None:
+            if state._insufficient_balance:
+                state.running = False
+                state.status = "STOPPED: Insufficient balance"
+                _db_save_session()
+                break
             with state.lock:
                 state.consecutive_errors += 1
                 state.backoff_delay = min(
