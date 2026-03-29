@@ -57,6 +57,7 @@ PRESET_PATH  = os.path.expanduser("~/.shuffle_presets.json")
 LOG_DIR      = os.path.expanduser("~/.shuffle_logs")
 VERSION      = "1.0.0"
 MIN_BET      = 0.001   # Shuffle minimum bet
+APP_ENV      = os.environ.get("APP_ENV", "production")
 
 # -- Daily rotating logger --
 os.makedirs(LOG_DIR, exist_ok=True)
@@ -380,7 +381,8 @@ def _load_all_presets() -> dict:
         return {}
 
 def _save_all_presets(presets: dict):
-    with open(PRESET_PATH, "w") as f:
+    fd = os.open(PRESET_PATH, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
         json.dump(presets, f, indent=2)
 
 def save_preset(name: str):
@@ -982,7 +984,7 @@ def api_test_connection() -> bool:
 
 def api_place_bet(amount: float) -> Optional[dict]:
     """Place a bet via GraphQL. Returns parsed result dict or None."""
-    if amount > 0 and amount < MIN_BET:
+    if amount < MIN_BET:
         amount = MIN_BET
 
     game_info = GAMES[state.game]
@@ -1251,7 +1253,7 @@ def betting_loop():
         # calculate next bet
         raw_next  = compute_next_bet(bet_state)
         next_bet  = max(state.base_bet, raw_next)
-        if next_bet > 0 and next_bet < MIN_BET:
+        if next_bet < MIN_BET:
             next_bet = MIN_BET
         state.current_bet = next_bet
         last_result = bet_state
@@ -2134,7 +2136,8 @@ def setup_wizard():
             api_test_connection()
             console.print("[green]  Connected![/]\n")
         except Exception as e:
-            console.print(f"[red]  Connection failed: {e}[/]")
+            detail = f": {e}" if APP_ENV != "production" else ""
+            console.print(f"[red]  Connection failed{detail}.[/]")
             console.print("[yellow]  Check your token and try again.[/]\n")
             state.bearer_token = ""
             return False
@@ -2866,7 +2869,8 @@ def cmd_stop():
         console.print("[yellow]Process not running.[/]")
         _cleanup_state_file()
     except Exception as e:
-        console.print(f"[red]Error: {e}[/]")
+        detail = f": {e}" if APP_ENV != "production" else ""
+        console.print(f"[red]Error{detail}.[/]")
 
 def cmd_list_presets():
     presets = list_presets()
@@ -3457,7 +3461,8 @@ def _load_and_connect():
         if state.start_balance > 0:
             console.print(f"  [dim]Balance:[/] {state.start_balance:.8f} {state.currency.upper()}")
     except Exception as e:
-        console.print(f"[red]Connection failed: {e}[/]")
+        detail = f": {e}" if APP_ENV != "production" else ""
+        console.print(f"[red]Connection failed{detail}. Check your settings and try again.[/]")
         sys.exit(1)
 
 def main():
@@ -3537,7 +3542,8 @@ def main():
         try:
             api_test_connection()
         except Exception as e:
-            console.print(f"[red]Connection failed: {e}[/]")
+            detail = f": {e}" if APP_ENV != "production" else ""
+            console.print(f"[red]Connection failed{detail}. Check your settings and try again.[/]")
             sys.exit(1)
 
     elif args.resume or args.daemon:
