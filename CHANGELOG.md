@@ -1,5 +1,30 @@
 # Changelog
 
+## v1.0.2 — Win Detection, Security & TG Fixes (2026-03-29)
+
+### CLI Bot v1.0.2
+
+#### Fixed
+
+- **Win detection on free/zero bets** — `is_win = payout > 0` always returned false on zero-amount bets (payout is 0 even on wins). Limbo now checks `result_multiplier >= target_multiplier`, Dice checks `result > target` for ABOVE or `result < target` for BELOW
+- **Connection test** — Replaced zero-bet test with read-only `GetMyProfile` query after Shuffle rejected zero bets with `ZERO_BET_LIMIT`
+
+#### Security
+
+- **ENV-controlled error messages** — TG bot error handlers now log full details server-side and show user-friendly messages in production. Controlled via `APP_ENV` environment variable (defaults to `production`)
+- **`shufflectl` self-update safety** — Script wrapped in `{ }` block so bash reads entire file into memory before executing, preventing parse errors when `cmd_update` replaces the file mid-run
+
+### TG Bot v1.0.2
+
+#### Fixed
+
+- **Win detection on free/zero bets** — Same result-based fix applied to TG engine for both Limbo and Dice
+- **Connection test** — Replaced zero-bet test with profile query (same as CLI)
+- **GraphQL schema** — Removed deprecated `AuthenticatedUser` type from balance query (Shuffle removed it, causing HTTP 400)
+- **`/settoken` Bearer prefix** — Now handles `Bearer eyJ...` input by stripping the prefix automatically
+
+---
+
 ## v1.0.1 — Stats, Status & Ops Improvements (2026-03-26)
 
 ### CLI Bot v1.0.1
