@@ -55,7 +55,7 @@ STATE_PATH   = os.path.expanduser("~/.shuffle_autobot_live.json")
 PID_PATH     = os.path.expanduser("~/.shuffle_autobot.pid")
 PRESET_PATH  = os.path.expanduser("~/.shuffle_presets.json")
 LOG_DIR      = os.path.expanduser("~/.shuffle_logs")
-VERSION      = "1.0.5"
+VERSION      = "1.0.6"
 MIN_BET      = 0.001   # Shuffle minimum bet
 APP_ENV      = os.environ.get("APP_ENV", "production")
 
@@ -1214,7 +1214,7 @@ def betting_loop():
             elapsed = now - state.session_start
             if elapsed > 0:
                 state.bets_per_second = state.total_bets / elapsed
-                state.bets_per_minute = state._bets_this_min
+                state.bets_per_minute = state.bets_per_second * 60
 
             sec_key = int(now)
             min_key = int(now) // 60
