@@ -125,14 +125,11 @@ fragment DiceFields on Dice {
 
 _BALANCE_QUERY = """query GetMyProfile {
   me {
-    ... on AuthenticatedUser {
-      id
-      account {
-        balances {
-          currency
-          availableAmount
-          __typename
-        }
+    id
+    account {
+      balances {
+        currency
+        availableAmount
         __typename
       }
       __typename
@@ -443,29 +440,12 @@ class BettingEngine:
         return []
 
     def _api_test_connection(self) -> bool:
-        """Test auth with a zero-bet."""
-        game_info = GAMES[self.game]
-        build = game_info["build_payload"]
-        resp_key = game_info["response_key"]
-
-        saved = self.current_bet
-        self.current_bet = 0
-        payload = build(self)
-        self.current_bet = saved
-
+        """Test auth by fetching the user profile (read-only, no bet placed)."""
         try:
-            data = self._gql_post(payload)
-            if data is None:
-                self.last_error = "Empty response"
-                return False
-            gql_data = data.get("data", {})
-            if resp_key in gql_data:
+            balances = self.api_get_balances()
+            if isinstance(balances, list):
                 return True
-            errors = data.get("errors")
-            if errors:
-                self.last_error = str(errors)[:200]
-                return False
-            self.last_error = f"Missing {resp_key} in response"
+            self.last_error = "Unexpected response from profile query"
             return False
         except Exception as e:
             self.last_error = str(e)[:200]
