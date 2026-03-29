@@ -46,6 +46,16 @@ cp tg/engine.py      "$INSTALL_DIR/tg/"
 cp tg/formatter.py   "$INSTALL_DIR/tg/"
 cp tg/handlers.py    "$INSTALL_DIR/tg/"
 cp tg/bot.py         "$INSTALL_DIR/tg/"
+
+# Copy shared/ library (cross-bot shared modules)
+if [ -d "../shared" ]; then
+    rm -rf "$INSTALL_DIR/shared"
+    cp -r ../shared "$INSTALL_DIR/"
+    echo "   shared/ library copied"
+else
+    echo "   ⚠ ../shared/ not found — shared imports may fail"
+fi
+
 # Copy .env
 if [ -f ".env" ]; then
     cp .env "$INSTALL_DIR/.env"

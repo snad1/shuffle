@@ -39,7 +39,7 @@ High-speed multi-game auto-betting engine for Shuffle.com (Limbo + Dice) with a 
 # 1. Setup
 cd shuffle
 python3 -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
+pip install -r requirements.txt  # includes casino-shared from GitHub
 
 # 2. Run (wizard guides you through config)
 python3 shuffle.py
