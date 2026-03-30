@@ -1,5 +1,17 @@
 # Changelog
 
+## v1.0.7 — Recurring Bets & Zero-Balance Start (2026-03-29)
+
+### Added
+
+- **Recurring bet feature** — Sessions auto-restart after configurable delay when stopped by conditions (profit target, max bets, etc). Configure with `/set recurring on|off` and `/set recurringdelay <seconds>`. Cancel with `/stop recurring`
+
+### Fixed
+
+- **TG engine zero-balance start** — Allow zero-balance sessions when base bet is 0 (previously blocked with "No balance found")
+
+---
+
 ## v1.0.6 — Fix BPM Calculation (2026-03-29)
 
 ### Fixed
