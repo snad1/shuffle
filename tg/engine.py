@@ -1,44 +1,44 @@
-"""BettingEngine — per-user betting instance running in its own thread.
+"""BettingEngine — per-user betting instance running as async task.
 
 Key features:
-  - Cross-thread SQLite safety (temp conn for session start, lazy persistent in betting thread)
+  - Fully async (no threads) — single event-loop, asyncio.create_task
   - Batched DB writes (flush every 50 bets + save session stats on each flush)
   - _db_save_session(final=False) for periodic saves without setting ended_at
   - Multi-game support via game registry (Limbo + Dice)
-  - Bearer token auth (no Cloudflare bypass needed)
+  - Bearer token auth + curl_cffi async for Cloudflare TLS bypass
   - Profit-based base bet increment
   - Milestone callbacks
-  - Full ISO timestamps with microseconds
+  - Production-safe error messages via _set_error()
 """
 
+import asyncio
 import json
 import time
 import random
 import string
 import sqlite3
-import threading
 from datetime import datetime
 from collections import deque
 from typing import Optional, List
 
-from .config import API_URL, MIN_BET, logger
+from .config import API_URL, APP_ENV, MIN_BET, logger
 from core.database import init_db, db_connect, cleanup_old_bets
 from core.strategy import StrategyRule, load_rules_from_text
 from core.engine import compute_next_bet, apply_action, evaluate_rules
 
-# Try curl_cffi for TLS fingerprint bypass on servers; fall back to requests
+# Try curl_cffi async for TLS fingerprint bypass; fall back to httpx
 try:
-    from curl_cffi import requests as cffi_requests
-    _HAS_CFFI = True
+    from curl_cffi.requests import AsyncSession as CffiAsyncSession
+    _HAS_CFFI_ASYNC = True
 except ImportError:
-    _HAS_CFFI = False
+    _HAS_CFFI_ASYNC = False
 
-import requests
+import httpx
 
 # ── Batching / periodic save constants ──────────────────
 BET_BATCH_SIZE     = 50      # flush bets + session stats to DB every N bets
 SESSION_SAVE_SECS  = 30      # fallback: save session stats every N seconds
-REQUEST_TIMEOUT    = (5, 15) # (connect, read) in seconds
+REQUEST_TIMEOUT    = httpx.Timeout(15.0, connect=5.0)
 MAX_TIMEOUT_STREAK = 3       # recreate HTTP session after this many consecutive timeouts
 
 
@@ -231,12 +231,11 @@ def _cfg(config: dict, key: str, default, typ=float):
 
 
 class BettingEngine:
-    """Self-contained betting engine for one user. Runs in its own thread."""
+    """Self-contained betting engine for one user. Runs as an async task."""
 
     def __init__(self, user_id: int, db_path: str, config: dict):
         self.user_id = user_id
         self.db_path = db_path
-        self.lock    = threading.Lock()
 
         # ── auth ──
         self.bearer_token = config.get("bearer_token") or ""
@@ -342,27 +341,39 @@ class BettingEngine:
         self._last_session_save = 0.0
         self._db_connection: Optional[sqlite3.Connection] = None
 
-        # ── HTTP session ──
+        # ── async HTTP client ──
         self._http = None
 
-        # ── thread ──
-        self._thread: Optional[threading.Thread] = None
+        # ── async task ──
+        self._task: Optional[asyncio.Task] = None
 
     # ── HTTP ─────────────────────────────────────────────
-    def _init_http(self):
-        if _HAS_CFFI:
-            self._http = cffi_requests.Session(impersonate="chrome")
-        else:
-            self._http = requests.Session()
-
-    def _recreate_http(self):
+    async def _recreate_http(self):
+        """Close and recreate the async HTTP client."""
         try:
             if self._http:
-                self._http.close()
+                if hasattr(self._http, 'aclose'):
+                    await self._http.aclose()
+                else:
+                    self._http.close()
         except Exception:
             pass
-        self._init_http()
-        logger.info("User %d: HTTP session recreated", self.user_id)
+        if _HAS_CFFI_ASYNC:
+            self._http = CffiAsyncSession(impersonate="chrome")
+        else:
+            self._http = httpx.AsyncClient(
+                headers=self._headers(), timeout=REQUEST_TIMEOUT,
+            )
+        logger.info("User %d: HTTP client recreated", self.user_id)
+
+    def _set_error(self, friendly: str, technical: str = ""):
+        """Set last_error: friendly message in production, technical details in dev."""
+        if APP_ENV != "production" and technical:
+            self.last_error = technical
+        else:
+            self.last_error = friendly
+        if technical:
+            logger.warning("User %d: %s", self.user_id, technical)
 
     def _headers(self) -> dict:
         import uuid
@@ -379,15 +390,17 @@ class BettingEngine:
             "x-correlation-id": str(uuid.uuid4()),
         }
 
-    def _gql_post(self, payload: dict) -> Optional[dict]:
+    async def _gql_post(self, payload: dict) -> Optional[dict]:
+        if not self._http:
+            await self._recreate_http()
         for attempt in range(2):
             try:
-                r = self._http.post(API_URL, headers=self._headers(), json=payload, timeout=REQUEST_TIMEOUT)
+                r = await self._http.post(API_URL, headers=self._headers(), json=payload)
                 break
-            except (ConnectionError, ConnectionResetError, requests.exceptions.ConnectionError) as e:
+            except (ConnectionError, ConnectionResetError, OSError) as e:
                 if attempt == 0:
-                    logger.warning("User %d: Connection reset — recreating HTTP session", self.user_id)
-                    self._recreate_http()
+                    logger.warning("User %d: Connection reset — recreating HTTP client", self.user_id)
+                    await self._recreate_http()
                     continue
                 raise ConnectionError(f"Connection failed: {e}")
         if r.status_code != 200:
@@ -396,7 +409,7 @@ class BettingEngine:
         return r.json()
 
     # ── API ──────────────────────────────────────────────
-    def api_get_balances(self) -> list:
+    async def api_get_balances(self) -> list:
         """Fetch all balances via GraphQL."""
         payload = {
             "operationName": "GetMyProfile",
@@ -404,7 +417,7 @@ class BettingEngine:
             "variables": {},
         }
         try:
-            data = self._gql_post(payload)
+            data = await self._gql_post(payload)
             me = data.get("data", {}).get("me", {})
             account = me.get("account", {})
             balances = account.get("balances", [])
@@ -416,19 +429,19 @@ class BettingEngine:
             logger.warning("Balance fetch failed: %s", e)
         return []
 
-    def _api_test_connection(self) -> bool:
+    async def _api_test_connection(self) -> bool:
         """Test auth by fetching the user profile (read-only, no bet placed)."""
         try:
-            balances = self.api_get_balances()
+            balances = await self.api_get_balances()
             if isinstance(balances, list):
                 return True
-            self.last_error = "Unexpected response from profile query"
+            self._set_error("Unexpected response from profile query")
             return False
         except Exception as e:
-            self.last_error = str(e)[:200]
+            self._set_error("Connection test failed", str(e)[:200])
             return False
 
-    def _api_place_bet(self, amount: float) -> Optional[dict]:
+    async def _api_place_bet(self, amount: float) -> Optional[dict]:
         """Place a bet. Returns parsed result dict or None."""
         if 0 < amount < MIN_BET:
             amount = MIN_BET
@@ -445,29 +458,28 @@ class BettingEngine:
 
         try:
             t0 = time.time()
-            data = self._gql_post(payload)
+            data = await self._gql_post(payload)
             self._last_api_ms = (time.time() - t0) * 1000
             self._consecutive_timeouts = 0
 
             if data is None:
-                self.last_error = "Empty response"
+                self._set_error("Empty response")
                 return None
 
-            # Check for GraphQL errors
             errors = data.get("errors")
             if errors:
                 err_str = str(errors).lower()
                 if "insufficient" in err_str or "balance" in err_str:
-                    self.last_error = "Insufficient balance"
+                    self._set_error("Insufficient balance", f"Insufficient: {str(errors)[:120]}")
                     self._insufficient_balance = True
                     return None
-                self.last_error = f"API error: {str(errors)[:120]}"
+                self._set_error("API error", f"API error: {str(errors)[:120]}")
                 return None
 
             gql_data = data.get("data", {})
             raw = gql_data.get(resp_key)
             if not raw:
-                self.last_error = f"Empty {resp_key}"
+                self._set_error(f"Empty {resp_key}")
                 return None
 
             self._api_ms_total += self._last_api_ms
@@ -476,22 +488,22 @@ class BettingEngine:
         except ConnectionError as e:
             err = str(e)
             if "429" in err:
-                self.last_error = "Rate limit 429"
+                self._set_error("Rate limited", "Rate limit 429")
             elif "insufficient" in err.lower() or "balance" in err.lower():
-                self.last_error = "Insufficient balance"
+                self._set_error("Insufficient balance", f"Balance error: {err[:120]}")
                 self._insufficient_balance = True
             else:
-                self.last_error = err[:120]
-        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError):
+                self._set_error("Connection error", err[:120])
+        except (httpx.TimeoutException, httpx.ConnectError, OSError):
             self._consecutive_timeouts += 1
-            self.last_error = f"Request timeout (#{self._consecutive_timeouts})"
+            self._set_error("Request timeout", f"Request timeout (#{self._consecutive_timeouts})")
             if self._consecutive_timeouts >= MAX_TIMEOUT_STREAK:
-                logger.warning("User %d: %d consecutive timeouts — recreating HTTP session",
+                logger.warning("User %d: %d consecutive timeouts — recreating HTTP client",
                                self.user_id, self._consecutive_timeouts)
-                self._recreate_http()
+                await self._recreate_http()
                 self._consecutive_timeouts = 0
         except Exception as e:
-            self.last_error = str(e)[:120]
+            self._set_error("Bet request failed", str(e)[:120])
         return None
 
     # ── DB ───────────────────────────────────────────────
@@ -691,17 +703,18 @@ class BettingEngine:
         return ""
 
     # ── LIFECYCLE ────────────────────────────────────────
-    def start(self) -> bool:
-        """Connect, fetch balance, start betting thread. Returns True on success."""
-        self._init_http()
+    async def start(self) -> bool:
+        """Connect, fetch balance, start betting task. Returns True on success."""
+        if not self._http:
+            await self._recreate_http()
 
-        if not self._api_test_connection():
+        if not await self._api_test_connection():
             return False
 
         try:
-            balances = self.api_get_balances()
+            balances = await self.api_get_balances()
         except Exception as e:
-            self.last_error = f"Balance fetch failed: {e}"
+            self._set_error("Balance fetch failed", f"Balance fetch failed: {e}")
             return False
 
         bal = 0.0
@@ -710,7 +723,7 @@ class BettingEngine:
                 bal = float(b.get("amount", 0))
                 break
         if bal <= 0 and self.base_bet > 0:
-            self.last_error = f"No {self.currency.upper()} balance found"
+            self._set_error(f"No {self.currency.upper()} balance found")
             return False
 
         init_db(self.db_path)
@@ -725,8 +738,7 @@ class BettingEngine:
         self.running         = True
         self.status          = "Starting..."
 
-        self._thread = threading.Thread(target=self._betting_loop, daemon=True)
-        self._thread.start()
+        self._task = asyncio.create_task(self._betting_loop())
         return True
 
     # ── RESUME SUPPORT ────────────────────────────────────
@@ -813,12 +825,13 @@ class BettingEngine:
         self.next_profit_milestone  = snap.get("next_profit_milestone", 0.0)
         self._last_profit_milestone = snap.get("_last_profit_milestone", 0.0)
 
-    def start_resumed(self) -> bool:
-        self._init_http()
+    async def start_resumed(self) -> bool:
+        if not self._http:
+            await self._recreate_http()
         init_db(self.db_path)
 
-        if not self._api_test_connection():
-            self.last_error = f"Resume connection failed: {self.last_error}"
+        if not await self._api_test_connection():
+            self._set_error("Resume connection failed", f"Resume failed: {self.last_error}")
             return False
 
         self.running = True
@@ -829,15 +842,12 @@ class BettingEngine:
         if elapsed > 0 and self.total_bets > 0:
             self.bets_per_second = self.total_bets / elapsed
             self.bets_per_minute = self.bets_per_second * 60
-        self._thread = threading.Thread(target=self._betting_loop, daemon=True)
-        self._thread.start()
+        self._task = asyncio.create_task(self._betting_loop())
         logger.info("User %d: Resumed session #%d", self.user_id, self.session_id)
         return True
 
     def stop(self):
         self.running = False
-        if self._thread and self._thread.is_alive():
-            self._thread.join(timeout=10)
 
     def pause(self):
         self.paused = True
@@ -925,7 +935,7 @@ class BettingEngine:
         }
 
     # ── BETTING LOOP ─────────────────────────────────────
-    def _betting_loop(self):
+    async def _betting_loop(self):
         last_result = "none"
         logger.info("User %d: Session #%d started (%s %s)",
                      self.user_id, self.session_id, self.game, self.strategy)
@@ -933,7 +943,7 @@ class BettingEngine:
         while self.running:
             if self.paused:
                 self.status = "PAUSED"
-                time.sleep(0.5)
+                await asyncio.sleep(0.5)
                 continue
 
             stop, reason = self._should_stop()
@@ -946,10 +956,10 @@ class BettingEngine:
                 break
 
             if self.bet_delay > 0:
-                time.sleep(self.bet_delay)
+                await asyncio.sleep(self.bet_delay)
 
             self.status = f"Placing bet #{self.total_bets + 1}..."
-            result = self._api_place_bet(self.current_bet)
+            result = await self._api_place_bet(self.current_bet)
 
             if result is None:
                 if self._insufficient_balance:
@@ -966,7 +976,7 @@ class BettingEngine:
                     break
                 self.consecutive_errors += 1
                 self.backoff_delay = min(self.backoff_delay * 2, 30.0)
-                time.sleep(self.backoff_delay)
+                await asyncio.sleep(self.backoff_delay)
                 continue
 
             is_win       = result["is_win"]
@@ -976,83 +986,81 @@ class BettingEngine:
             bet_state    = "win" if is_win else "loss"
             rd           = result["result_display"]
 
-            with self.lock:
-                self.consecutive_errors = 0
-                self.backoff_delay = 1.0
-                self.total_bets += 1
-                self.wagered    += amount_used
-                self.profit     += raw_profit
+            self.consecutive_errors = 0
+            self.backoff_delay = 1.0
+            self.total_bets += 1
+            self.wagered    += amount_used
+            self.profit     += raw_profit
 
-                # Use afterBalance from API if available for accuracy
-                after_bal = result.get("after_balance")
-                if after_bal is not None:
-                    self.current_balance = after_bal
-                else:
-                    self.current_balance += raw_profit
+            after_bal = result.get("after_balance")
+            if after_bal is not None:
+                self.current_balance = after_bal
+            else:
+                self.current_balance += raw_profit
 
-                if is_win:
-                    self.wins += 1
-                    if raw_profit > self.highest_win:
-                        self.highest_win = raw_profit
-                    self.current_streak = max(self.current_streak, 0) + 1
-                    self.max_win_streak = max(self.max_win_streak, self.current_streak)
-                else:
-                    self.losses += 1
-                    if amount_used > self.biggest_loss:
-                        self.biggest_loss = amount_used
-                    self.current_streak = min(self.current_streak, 0) - 1
-                    self.max_loss_streak = max(self.max_loss_streak, abs(self.current_streak))
+            if is_win:
+                self.wins += 1
+                if raw_profit > self.highest_win:
+                    self.highest_win = raw_profit
+                self.current_streak = max(self.current_streak, 0) + 1
+                self.max_win_streak = max(self.max_win_streak, self.current_streak)
+            else:
+                self.losses += 1
+                if amount_used > self.biggest_loss:
+                    self.biggest_loss = amount_used
+                self.current_streak = min(self.current_streak, 0) - 1
+                self.max_loss_streak = max(self.max_loss_streak, abs(self.current_streak))
 
-                if amount_used > self.highest_bet:
-                    self.highest_bet = amount_used
-                if self.current_balance > self.highest_balance:
-                    self.highest_balance = self.current_balance
-                if self.current_balance < self.lowest_balance:
-                    self.lowest_balance = self.current_balance
+            if amount_used > self.highest_bet:
+                self.highest_bet = amount_used
+            if self.current_balance > self.highest_balance:
+                self.highest_balance = self.current_balance
+            if self.current_balance < self.lowest_balance:
+                self.lowest_balance = self.current_balance
 
-                if self.total_bets % 5 == 0:
-                    self.profit_history.append(self.profit)
+            if self.total_bets % 5 == 0:
+                self.profit_history.append(self.profit)
 
-                self.recent_bets.append({
-                    "n": self.total_bets, "time": datetime.now().isoformat(),
-                    "amt": amount_used, "result": rd,
-                    "state": bet_state, "pnl": raw_profit, "bal": self.current_balance,
-                })
+            self.recent_bets.append({
+                "n": self.total_bets, "time": datetime.now().isoformat(),
+                "amt": amount_used, "result": rd,
+                "state": bet_state, "pnl": raw_profit, "bal": self.current_balance,
+            })
 
-                # BPS/BPM tracking
-                now = time.time()
-                elapsed = now - self.session_start
-                if elapsed > 0:
-                    self.bets_per_second = self.total_bets / elapsed
-                    self.bets_per_minute = self.bets_per_second * 60
+            # BPS/BPM tracking
+            now = time.time()
+            elapsed = now - self.session_start
+            if elapsed > 0:
+                self.bets_per_second = self.total_bets / elapsed
+                self.bets_per_minute = self.bets_per_second * 60
 
-                sec_key = int(now)
-                min_key = int(now) // 60
-                if sec_key != self._current_sec:
-                    if self._current_sec > 0 and self._bets_this_sec > 0:
-                        if self._bets_this_sec > self.peak_bps:
-                            self.peak_bps = self._bets_this_sec
-                        if self._bets_this_sec < self.low_bps:
-                            self.low_bps = self._bets_this_sec
-                    self._current_sec = sec_key
-                    self._bets_this_sec = 1
-                else:
-                    self._bets_this_sec += 1
-                if min_key != self._current_min:
-                    if self._current_min > 0 and self._bets_this_min > 0:
-                        if self._bets_this_min > self.peak_bpm:
-                            self.peak_bpm = self._bets_this_min
-                        if self._bets_this_min < self.low_bpm:
-                            self.low_bpm = self._bets_this_min
-                    self._current_min = min_key
-                    self._bets_this_min = 1
-                else:
-                    self._bets_this_min += 1
+            sec_key = int(now)
+            min_key = int(now) // 60
+            if sec_key != self._current_sec:
+                if self._current_sec > 0 and self._bets_this_sec > 0:
+                    if self._bets_this_sec > self.peak_bps:
+                        self.peak_bps = self._bets_this_sec
+                    if self._bets_this_sec < self.low_bps:
+                        self.low_bps = self._bets_this_sec
+                self._current_sec = sec_key
+                self._bets_this_sec = 1
+            else:
+                self._bets_this_sec += 1
+            if min_key != self._current_min:
+                if self._current_min > 0 and self._bets_this_min > 0:
+                    if self._bets_this_min > self.peak_bpm:
+                        self.peak_bpm = self._bets_this_min
+                    if self._bets_this_min < self.low_bpm:
+                        self.low_bpm = self._bets_this_min
+                self._current_min = min_key
+                self._bets_this_min = 1
+            else:
+                self._bets_this_min += 1
 
-                sign  = "+" if raw_profit >= 0 else ""
-                emoji = "W" if is_win else "L"
-                self.status = f"{emoji} {'WIN' if is_win else 'LOSS'} | {rd} | P/L: {sign}{raw_profit:.8f}"
-                self.last_error = ""
+            sign  = "+" if raw_profit >= 0 else ""
+            emoji = "W" if is_win else "L"
+            self.status = f"{emoji} {'WIN' if is_win else 'LOSS'} | {rd} | P/L: {sign}{raw_profit:.8f}"
+            self.last_error = ""
 
             self._queue_bet(result, raw_profit, self.current_balance)
             self._periodic_save()

@@ -29,6 +29,10 @@ logging.basicConfig(
 )
 logger = logging.getLogger("shufflebot")
 
+# Suppress noisy HTTP client logs
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+
 # ── Config keys persisted per user ───────────────────────
 CONFIG_KEYS = [
     "bearer_token",
