@@ -55,7 +55,7 @@ STATE_PATH   = os.path.expanduser("~/.shuffle_autobot_live.json")
 PID_PATH     = os.path.expanduser("~/.shuffle_autobot.pid")
 PRESET_PATH  = os.path.expanduser("~/.shuffle_presets.json")
 LOG_DIR      = os.path.expanduser("~/.shuffle_logs")
-VERSION      = "1.1.0"
+VERSION      = "1.1.1"
 MIN_BET      = 0.001   # Shuffle minimum bet
 APP_ENV      = os.environ.get("APP_ENV", "production")
 
