@@ -1,4 +1,4 @@
-# Shuffle AutoBot v1.1.3 + Telegram Bot v1.1.3 + Web Admin v0.1
+# Shuffle AutoBot v1.2.0 + Telegram Bot v1.2.0 + Web Admin v0.1
 
 High-speed multi-game auto-betting engine for Shuffle.com (Limbo + Dice) with a live terminal dashboard, a Telegram bot, and a web admin panel. Uses GraphQL API with Bearer token auth and curl_cffi Chrome TLS fingerprinting for server deployments.
 
