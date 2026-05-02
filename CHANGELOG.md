@@ -1,5 +1,11 @@
 # Changelog
 
+## v1.4.1 — Fix _safe_send infinite recursion (2026-05-02)
+
+### Fixed
+
+- **`_safe_send` infinite recursion** — The function was calling itself instead of `app.bot.send_message`, causing `RecursionError: maximum recursion depth exceeded` on every Telegram notification (stops, milestones, errors). Fixed to call `app.bot.send_message` directly.
+
 ## v1.4.0 — Recurring honors live config across all running sessions (2026-04-28)
 
 ### Fixed
