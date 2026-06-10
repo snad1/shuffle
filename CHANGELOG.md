@@ -1,5 +1,11 @@
 # Changelog
 
+## v1.4.6 — /update cd's into repo dir before running ctl (2026-06-11)
+
+### Fixed
+
+- **/update failed with "No shuffle.py in current directory"** — `systemd-run` spawns bash with cwd=/. Now `cd /root/shuffle && shufflectl update` is the bash command. Override via `BOT_REPO_DIR` env var if your layout is different.
+
 ## v1.4.5 — /update reports real errors + writes update log (2026-06-10)
 
 ### Fixed
