@@ -1,5 +1,15 @@
 # Changelog
 
+## v1.5.0 — Auto-revive: systemd retry-forever + external stall watchdog (2026-06-17)
+
+### Added
+
+- **`Restart=always` + `StartLimitIntervalSec=0`** on both CLI and TG bot services.
+- **External stall watchdog timer** — `shuffle-tg-watchdog.timer` fires every 2 min; if `/tmp/shuffle-tg.heartbeat` is older than 180s, restarts `shuffle-tg`.
+- **Heartbeat task** — `_heartbeat_loop()` writes the heartbeat file every 30s from `post_init`.
+
+If the bot crashes, systemd brings it back in 10s. If it stalls, the watchdog brings it back within ~3 min. No more SSH-and-restart.
+
 ## v1.4.6 — /update cd's into repo dir before running ctl (2026-06-11)
 
 ### Fixed

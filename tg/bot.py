@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """Shuffle Telegram Bot — entry point and Application wiring."""
 
+import asyncio
 import atexit
 import os
 import signal
 import sys
+import time
 
 from telegram import BotCommand
 from telegram.error import RetryAfter, NetworkError, TimedOut
@@ -25,6 +27,20 @@ from .handlers import (
 )
 
 _resume_saved = False
+HEARTBEAT_FILE = "/tmp/shuffle-tg.heartbeat"
+
+
+async def _heartbeat_loop():
+    """Write a fresh mtime to HEARTBEAT_FILE every 30s so the external
+    watchdog timer knows the bot's event loop is still alive."""
+    while True:
+        try:
+            with open(HEARTBEAT_FILE, "w") as f:
+                f.write(str(int(time.time())))
+        except Exception as e:
+            logger.warning("Heartbeat write failed: %s", e)
+        await asyncio.sleep(30)
+
 
 def _save_once():
     global _resume_saved
@@ -87,6 +103,7 @@ def main():
             BotCommand("delsession",  "Delete a session by ID"),
         ])
         logger.info("Bot commands registered with Telegram")
+        asyncio.create_task(_heartbeat_loop())
         await load_resume_state(application)
 
     async def post_shutdown(application):

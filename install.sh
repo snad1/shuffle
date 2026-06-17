@@ -81,12 +81,13 @@ cat > "$SYSTEMD_DIR/${SERVICE_NAME}.service" << SERVICEEOF
 Description=Shuffle AutoBot — Multi-Game Auto-Betting Engine
 After=network-online.target
 Wants=network-online.target
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
 WorkingDirectory=${INSTALL_DIR}
 ExecStart=${INSTALL_DIR}/venv/bin/python3 ${INSTALL_DIR}/shuffle.py --resume --daemon
-Restart=on-failure
+Restart=always
 RestartSec=10
 StandardOutput=journal
 StandardError=journal
@@ -109,12 +110,13 @@ cat > "$SYSTEMD_DIR/${TG_SERVICE_NAME}.service" << TGSERVICEEOF
 Description=Shuffle Telegram Bot — Multi-Game Auto-Betting via Telegram
 After=network-online.target
 Wants=network-online.target
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
 WorkingDirectory=${INSTALL_DIR}
 ExecStart=${INSTALL_DIR}/venv/bin/python3 -m tg.bot
-Restart=on-failure
+Restart=always
 RestartSec=10
 StandardOutput=journal
 StandardError=journal
@@ -133,9 +135,34 @@ EnvironmentFile=-${HOME}/.shuffle_tg_env
 WantedBy=default.target
 TGSERVICEEOF
 
+# Watchdog: restart TG bot if heartbeat file is stale (catches stuck-but-alive)
+cat > "$SYSTEMD_DIR/${TG_SERVICE_NAME}-watchdog.service" << WDSERVICEEOF
+[Unit]
+Description=Shuffle Telegram Bot — Stall Watchdog
+After=${TG_SERVICE_NAME}.service
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash -c 'f=/tmp/${TG_SERVICE_NAME}.heartbeat; if [ ! -f "\$f" ] || [ \$(( \$(date +%%s) - \$(stat -c %%Y "\$f") )) -gt 180 ]; then echo "Heartbeat stale, restarting ${TG_SERVICE_NAME}"; systemctl --user restart ${TG_SERVICE_NAME}.service; fi'
+WDSERVICEEOF
+
+cat > "$SYSTEMD_DIR/${TG_SERVICE_NAME}-watchdog.timer" << WDTIMEREOF
+[Unit]
+Description=Shuffle Telegram Bot — Stall Watchdog Timer (every 2 min)
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=2min
+Unit=${TG_SERVICE_NAME}-watchdog.service
+
+[Install]
+WantedBy=timers.target
+WDTIMEREOF
+
 sudo loginctl enable-linger "$(whoami)" 2>/dev/null || true
 systemctl --user daemon-reload
-echo "   Services installed: ${SERVICE_NAME}.service, ${TG_SERVICE_NAME}.service"
+systemctl --user enable --now ${TG_SERVICE_NAME}-watchdog.timer 2>/dev/null || true
+echo "   Services installed: ${SERVICE_NAME}.service, ${TG_SERVICE_NAME}.service, ${TG_SERVICE_NAME}-watchdog.timer"
 
 # ── 5. Management scripts ─────────────────────────────
 echo "[5/7] Creating management commands…"
