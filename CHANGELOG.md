@@ -1,5 +1,11 @@
 # Changelog
 
+## v1.6.4 — Efficiency % indicator (2026-06-17)
+
+### Added
+
+- **`Efficiency: X%`** on the dashboard — bot's actual recent bps as a % of the theoretical max (= 1 / max(bet_delay, api_avg)). Single number that answers "is the bot at peak?".
+
 ## v1.6.3 — API peak time on the dashboard (2026-06-17)
 
 ### Added
