@@ -1,5 +1,11 @@
 # Changelog
 
+## v1.6.2 — Cycle metric: full per-bet time (bps reciprocal) (2026-06-17)
+
+### Added
+
+- **`Cycle: Xms/bet`** on the dashboard — exp-smoothed time between consecutive bet starts. This is the bps reciprocal (`Cycle × bps ≈ 1000`), shown inline as `(1000/385 = 2.60 bps)`. Complements `Overhead` (post-API processing only) — `Cycle` is the honest end-to-end number.
+
 ## v1.6.1 — Per-cycle overhead diagnostic + get_status() cache (2026-06-17)
 
 ### Added
