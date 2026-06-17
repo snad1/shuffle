@@ -1,5 +1,17 @@
 # Changelog
 
+## v1.6.0 — Sliding-window BPS + non-blocking SQLite writes (2026-06-17)
+
+### Added
+
+- **`Now` bps (sliding 60s window)** alongside the existing cumulative `Avg` — dashboard now shows both.
+
+### Changed
+
+- **DB writes no longer block the event loop.** `_flush_bets`, `_db_save_session`, and `cleanup_live_bets` now run via `asyncio.to_thread`. Inline batch-size flush trigger removed. Shared `db_connect` now opens with `check_same_thread=False`.
+
+Result: multiple concurrent sessions scale closer to single-session throughput.
+
 ## v1.5.0 — Auto-revive: systemd retry-forever + external stall watchdog (2026-06-17)
 
 ### Added
