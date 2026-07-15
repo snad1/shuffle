@@ -1,3 +1,3 @@
 """Shuffle Telegram Bot — Multi-tenant auto-betting via Telegram."""
 
-VERSION = "1.6.8"
+VERSION = "1.6.10"
