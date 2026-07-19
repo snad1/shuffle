@@ -286,6 +286,8 @@ class BettingEngine:
         self.paused          = False
         self.session_id      = None
         self.session_start   = 0.0
+        self.session_bet_ended_at: Optional[float] = None
+        self.session_pause_started_at: Optional[float] = None
         self.total_bets      = 0
         self.wins            = 0
         self.losses          = 0
@@ -611,6 +613,11 @@ class BettingEngine:
             self._db_connection = sqlite3.connect(
                 self.db_path, timeout=5, check_same_thread=False)
             self._db_connection.execute("PRAGMA journal_mode=WAL")
+            # v1.7.0 — mirrors wolfbet v2.27.0. WAL-safe.
+            self._db_connection.execute("PRAGMA synchronous = NORMAL")
+            self._db_connection.execute("PRAGMA busy_timeout = 5000")
+            self._db_connection.execute("PRAGMA cache_size = -32000")
+            self._db_connection.execute("PRAGMA temp_store = MEMORY")
         return self._db_connection
 
     def _close_conn(self):
@@ -737,7 +744,11 @@ class BettingEngine:
                         peak_bps=?, low_bps=?, peak_bpm=?, low_bpm=?,
                         chart_snapshots=?
                     WHERE id=?
-                """, (datetime.now().isoformat(),) + fields)
+                """, (
+                    # v1.7.0 — freeze ended_at during pauses.
+                    (datetime.fromtimestamp(self.session_bet_ended_at).isoformat()
+                     if self.session_bet_ended_at else datetime.now().isoformat()),
+                ) + fields)
             else:
                 conn.execute("""
                     UPDATE sessions SET
@@ -1074,9 +1085,16 @@ class BettingEngine:
         return "; ".join(msgs) if msgs else "No changes applied"
 
     def pause(self):
+        # v1.7.0 — freeze uptime.
+        if not self.paused:
+            now = time.time()
+            self.session_bet_ended_at = now
+            self.session_pause_started_at = now
         self.paused = True
 
     def resume(self):
+        self.session_bet_ended_at = None
+        self.session_pause_started_at = None
         self.paused = False
 
     def get_status(self) -> dict:
@@ -1085,7 +1103,10 @@ class BettingEngine:
         now_mono = time.monotonic()
         if self._status_cache is not None and (now_mono - self._status_cache_ts) < 0.25:
             return self._status_cache
-        elapsed = time.time() - self.session_start if self.session_start else 0
+        # v1.7.0 — freeze uptime at bet-end during pauses.
+        now = time.time()
+        ref = self.session_bet_ended_at if self.session_bet_ended_at else now
+        elapsed = ref - self.session_start if self.session_start else 0
         h, rem = divmod(int(elapsed), 3600)
         m, s = divmod(rem, 60)
         wr = f"{self.wins/self.total_bets*100:.1f}%" if self.total_bets > 0 else "\u2014"
@@ -1121,6 +1142,8 @@ class BettingEngine:
             "paused": self.paused,
             "session_id": self.session_id,
             "uptime": f"{h}h {m}m {s}s",
+            "uptime_sec": int(elapsed),
+            "pause_remaining_sec": 0,
             "bets": self.total_bets,
             "wins": self.wins,
             "losses": self.losses,
