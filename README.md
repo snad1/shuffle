@@ -1,4 +1,4 @@
-# Shuffle AutoBot v1.5.0 + Telegram Bot v1.7.0 + Web Admin v0.1
+# Shuffle AutoBot v1.6.0 + Telegram Bot v1.8.0 + Web Admin v0.1
 
 High-speed multi-game auto-betting engine for Shuffle.com (Limbo + Dice) with a live terminal dashboard, a Telegram bot, and a web admin panel. Uses GraphQL API with Bearer token auth and curl_cffi Chrome TLS fingerprinting for server deployments.
 
@@ -107,6 +107,7 @@ python3 shuffle.py --stop            # Stop a running daemon
 python3 shuffle.py --setup-only      # Run wizard, save config, don't start
 python3 shuffle.py --list-presets    # Show saved presets
 python3 shuffle.py --stats           # Show all session history + totals + uptime
+                                     #   add --since DATE / --until DATE for a date window
 python3 shuffle.py --last-bets N     # Show last N bets across sessions
 python3 shuffle.py --session-bets N  # Full stats + streak distribution for session N
 ```
@@ -128,7 +129,7 @@ shufflectl logs           # Stream live logs
 shufflectl logs-full      # Show last 200 log lines
 shufflectl interactive    # Start daemon + attach monitor
 shufflectl tmux           # Monitor in detachable tmux session
-shufflectl stats          # View all-time statistics
+shufflectl stats          # View all-time statistics (--since/--until for a window)
 shufflectl session ID     # Full stats + streak distribution
 shufflectl presets        # List saved presets
 shufflectl update         # Update bot from current directory
@@ -171,6 +172,7 @@ The Telegram bot (`shuffle/tg/`) provides the same engine via Telegram commands.
 | `/status [slot]` | Live status |
 | `/monitor [slot] [interval]` | Auto-updating status (3-60s) |
 | `/stats` | Session history (last 10) |
+| `/analytics [since] [until]` | Lifetime or date-windowed analytics (e.g. `/analytics 2026-08-14`) |
 | `/session <id>` | Full session report |
 | `/lastbets [n]` | Recent bets |
 | `/rules` / `/addrule` / `/delrule` / `/editrule` / `/clearrules` | Manage rules |

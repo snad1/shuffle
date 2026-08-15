@@ -48,11 +48,11 @@ def _mk_engine(db):
 
 # ── VERSION ───────────────────────────────────────────────
 def test_cli_version():
-    assert sh.VERSION == "1.5.0"
+    assert sh.VERSION == "1.6.0"
 
 
 def test_tg_version():
-    assert tg.VERSION == "1.7.0"
+    assert tg.VERSION == "1.8.0"
 
 
 # ── PRAGMAs ───────────────────────────────────────────────
@@ -236,3 +236,68 @@ def test_help_mentions_new_commands():
     src = inspect.getsource(tg_handlers.cmd_help)
     assert "/diagnose" in src
     assert "/analytics" in src
+
+
+# ── Date-range filters (v1.6.0 / TG v1.8.0) ───────────────
+def test_stats_date_window_empty():
+    assert sh._stats_date_window() == ("", [], "")
+    assert sh._stats_date_window(since=None, until=None) == ("", [], "")
+
+
+def test_stats_date_window_since_only():
+    clause, params, label = sh._stats_date_window(since="2026-08-01")
+    assert clause == " WHERE started_at >= ?"
+    assert params == ["2026-08-01"]
+    assert "2026-08-01" in label and "→" in label
+
+
+def test_stats_date_window_until_extended_to_end_of_day():
+    clause, params, _ = sh._stats_date_window(until="2026-08-15")
+    assert clause == " WHERE started_at <= ?"
+    assert params == ["2026-08-15T23:59:59"]
+    _, params2, _ = sh._stats_date_window(since="2026-08-01", until="2026-08-15T12:00:00")
+    assert params2 == ["2026-08-01", "2026-08-15T12:00:00"]
+
+
+def test_cmd_stats_filters_by_date_window():
+    db = _mk_db()
+    old_db = sh.DB_PATH
+    try:
+        sh.DB_PATH = db
+        conn = sqlite3.connect(db)
+        for sid, day in ((1, "2026-08-01"), (2, "2026-08-10"), (3, "2026-08-15")):
+            conn.execute(
+                "INSERT INTO sessions (id, started_at, currency, game, strategy, "
+                "base_bet, multiplier, start_balance, total_bets, wins, losses, profit, wagered) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (sid, day + "T12:00:00", "usdt", "limbo", "Flat", 0.0001, 2.0, 1.0,
+                 10, 5, 5, 0.0001, 0.001))
+        conn.commit()
+        conn.close()
+        with sh.console.capture() as cap:
+            sh.cmd_stats(since="2026-08-05", until="2026-08-12")
+        out = _strip_ansi(cap.get())
+        assert "Session #2" in out
+        assert "Session #1" not in out and "Session #3" not in out
+        assert "Range Totals" in out
+        assert "Sessions:      1" in out
+    finally:
+        sh.DB_PATH = old_db
+        os.remove(db)
+
+
+def test_argparse_since_until_on_standalone_parser():
+    src = inspect.getsource(sh.main)
+    assert 'parser.add_argument("--since"' in src
+    assert 'parser.add_argument("--until"' in src
+    for line in src.splitlines():
+        if "--since" in line or "--until" in line:
+            assert line.strip().startswith("parser.add_argument")
+    assert 'cmd_stats(since=args.since, until=args.until)' in src
+
+
+def test_tg_analytics_supports_date_window():
+    src = inspect.getsource(tg_handlers.cmd_analytics)
+    assert "context.args" in src
+    assert src.count("FROM sessions{where}") == 5
+    assert "'Range' if args_ else 'Lifetime'" in src

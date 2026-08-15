@@ -1,5 +1,15 @@
 # Changelog
 
+## CLI v1.6.0 / TG v1.8.0 — Date-range filters (2026-08-15)
+
+Mirrors wolfbet v2.30.9. Both surfaces now filter analytics to a date window.
+
+- **CLI `--since` / `--until`** (standalone parser args, used with `--stats`) — bare `YYYY-MM-DD` or full ISO timestamps; a bare `until` is extended to end-of-day so the day is inclusive. Shared helper `_stats_date_window()` builds the WHERE clause; both the session list (limit 50 when filtering, 20 otherwise) and totals honor the window. Headers show the window and switch to "Range Totals".
+- **`shufflectl stats`** now forwards extra args — `shufflectl stats --since 2026-08-01 --until 2026-08-15` works.
+- **TG `/analytics [SINCE] [UNTIL]`** — all 5 queries (lifetime, by-game, by-strategy, top-5 best/worst) honor the window; header shows `Range analytics` + window label. `>2` args prints a usage hint. `/help` updated.
+
+`VERSION` `1.5.0` → `1.6.0`. `tg/__init__.py` `1.7.0` → `1.8.0`. Tests: 21 → 27.
+
 ## CLI v1.5.0 / TG v1.7.0 — WolfBet hardening subset ported (2026-07-19)
 
 Same portable subset as cryptogames + duckdice v1.5.0. No bet-loop change.

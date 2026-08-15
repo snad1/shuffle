@@ -162,7 +162,7 @@ cmd_tmux() {
 }
 
 cmd_stats() {
-    "$PYTHON" "$BOT" --stats
+    "$PYTHON" "$BOT" --stats "$@"
 }
 
 cmd_session() {
@@ -467,7 +467,7 @@ case "${1:-}" in
     logs-full)    cmd_logs_full ;;
     interactive)  cmd_interactive ;;
     tmux)         cmd_tmux ;;
-    stats)        cmd_stats ;;
+    stats)        cmd_stats "${@:2}" ;;
     session)      cmd_session "${2:-}" ;;
     presets)      cmd_presets ;;
     update)       cmd_update ;;

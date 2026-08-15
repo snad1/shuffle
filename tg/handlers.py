@@ -199,7 +199,8 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/session \u2014 Detailed session report\n"
         "/lastbets \u2014 Recent bets\n"
         "/diagnose \u2014 Bottleneck analysis (top blocker + advice)\n"
-        "/analytics \u2014 Lifetime analytics (per-game, per-strategy, top-5)\n\n"
+        "/analytics \u2014 Lifetime analytics (per-game, per-strategy, top-5)\n"
+        "/analytics [SINCE] [UNTIL] \u2014 date-windowed (e.g. 2026-08-14)\n\n"
         "*Rules*\n"
         "/rules \u2014 List current rules\n"
         "/addrule \u2014 Add rule (JSON)\n"
@@ -1649,45 +1650,67 @@ async def cmd_diagnose(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_analytics(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """v1.7.0 — lifetime analytics."""
+    """v1.8.0 — lifetime or date-windowed analytics."""
     user_id = update.effective_user.id
     db_path = user_db_path(user_id)
     if not os.path.exists(db_path):
         await update.message.reply_text("No session history yet."); return
+
+    since = until = None
+    args_ = list(context.args or [])
+    if len(args_) > 2:
+        await update.message.reply_text(
+            "Usage: `/analytics [SINCE] [UNTIL]` — e.g. `/analytics 2026-08-14` "
+            "or `/analytics 2026-08-01 2026-08-15`", parse_mode="Markdown")
+        return
+    if args_:
+        since = args_[0]
+        if len(args_) == 2:
+            until = args_[1]
+            if len(until) == 10:
+                until += "T23:59:59"
+    wconds, wparams = [], []
+    if since:
+        wconds.append("started_at >= ?"); wparams.append(since)
+    if until:
+        wconds.append("started_at <= ?"); wparams.append(until)
+    where = (" WHERE " + " AND ".join(wconds)) if wconds else ""
+    window_label = f"  ({since or '…'} → {args_[1] if len(args_) == 2 else '…'})" if args_ else ""
+
     init_db(db_path)
     conn = sqlite3.connect(db_path)
     try:
-        lifetime = conn.execute("""
+        lifetime = conn.execute(f"""
             SELECT COUNT(*), COALESCE(SUM(total_bets),0), COALESCE(SUM(wins),0),
                    COALESCE(SUM(losses),0), COALESCE(SUM(wagered),0),
                    COALESCE(SUM(profit),0), COALESCE(MAX(profit),0),
                    COALESCE(MIN(profit),0),
                    SUM(CASE WHEN profit>=0 THEN 1 ELSE 0 END),
                    SUM(CASE WHEN profit<0  THEN 1 ELSE 0 END)
-            FROM sessions
-        """).fetchone()
-        by_game = conn.execute("""
+            FROM sessions{where}
+        """, tuple(wparams)).fetchone()
+        by_game = conn.execute(f"""
             SELECT COALESCE(game,'?'), COUNT(*), COALESCE(SUM(total_bets),0),
                    COALESCE(SUM(wins),0), COALESCE(SUM(losses),0),
                    COALESCE(SUM(profit),0), COALESCE(SUM(wagered),0)
-            FROM sessions GROUP BY game ORDER BY 6 DESC
-        """).fetchall()
-        by_strat = conn.execute("""
+            FROM sessions{where} GROUP BY game ORDER BY 6 DESC
+        """, tuple(wparams)).fetchall()
+        by_strat = conn.execute(f"""
             SELECT COALESCE(strategy,'?'), COUNT(*), COALESCE(SUM(total_bets),0),
                    COALESCE(SUM(wins),0), COALESCE(SUM(losses),0),
                    COALESCE(SUM(profit),0), COALESCE(SUM(wagered),0)
-            FROM sessions GROUP BY strategy ORDER BY 6 DESC
-        """).fetchall()
-        top_best = conn.execute("""
+            FROM sessions{where} GROUP BY strategy ORDER BY 6 DESC
+        """, tuple(wparams)).fetchall()
+        top_best = conn.execute(f"""
             SELECT id, COALESCE(game,'?'), COALESCE(strategy,'?'),
                    COALESCE(total_bets,0), COALESCE(profit,0)
-            FROM sessions ORDER BY profit DESC LIMIT 5
-        """).fetchall()
-        top_worst = conn.execute("""
+            FROM sessions{where} ORDER BY profit DESC LIMIT 5
+        """, tuple(wparams)).fetchall()
+        top_worst = conn.execute(f"""
             SELECT id, COALESCE(game,'?'), COALESCE(strategy,'?'),
                    COALESCE(total_bets,0), COALESCE(profit,0)
-            FROM sessions ORDER BY profit ASC LIMIT 5
-        """).fetchall()
+            FROM sessions{where} ORDER BY profit ASC LIMIT 5
+        """, tuple(wparams)).fetchall()
     finally:
         conn.close()
 
@@ -1699,7 +1722,7 @@ async def cmd_analytics(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ps = "+" if profit_total >= 0 else ""
 
     lines = [
-        "*📈 Lifetime analytics*", "",
+        f"*📈 {'Range' if args_ else 'Lifetime'} analytics*{window_label}", "",
         f"Sessions: `{sess_total}` (`{in_prof or 0}` in profit / `{in_loss or 0}` in loss)",
         f"Bets: `{bets_total:,}`  ·  Win rate: `{wr:.1f}%`",
         f"P/L: `{ps}{profit_total:.8f}`  ·  Wagered: `{wagered_total:.8f}`",
