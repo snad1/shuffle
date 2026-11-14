@@ -44,6 +44,11 @@ def sleeps():
 def _sandbox(tmp_path, monkeypatch, sleeps):
     for name in ("DB_PATH", "CONFIG_PATH", "STATE_PATH", "PID_PATH", "PRESET_PATH"):
         monkeypatch.setattr(sh, name, str(tmp_path / f"cli_{name.lower()}"))
+    # v1.10.0 lanes: lane paths derive from the lane-1 paths; `_apply_lane`
+    # swaps the log formatter, restored after each test.
+    monkeypatch.setattr(sh, "_BASE_STATE_PATH", sh.STATE_PATH)
+    monkeypatch.setattr(sh, "_BASE_PID_PATH", sh.PID_PATH)
+    _fmt = sh._log_handler.formatter
     monkeypatch.setattr(tg_database, "DATA_DIR", str(tmp_path / "tg"))
     monkeypatch.setattr(sh, "state", sh.BotState())
 
@@ -54,6 +59,7 @@ def _sandbox(tmp_path, monkeypatch, sleeps):
     monkeypatch.setattr(sh.time, "sleep", sleeps.append)
     monkeypatch.setattr(tg_engine.asyncio, "sleep", fast_sleep)
     yield
+    sh._log_handler.setFormatter(_fmt)
 
 
 @pytest.fixture

@@ -1,5 +1,22 @@
 # Changelog
 
+## CLI v1.10.0 — Parallel lanes (2026-11-14)
+
+Mirrors WolfBet CLI v2.35.0 (parallel lanes) and v2.36.0 (`lane_split`), ported from WolfBet `6174b96` (the code wins over the CHANGELOG). Uses `shared.core.lanes` (casino-shared 0.2.0). TG unchanged. GraphQL documents, string amounts and `windowId` unchanged.
+
+- **Lane identity** — `--lane K` (1-10) is applied before any command, so `--status`, `--stop`, `--monitor` and `--diagnose` act on that lane. Lanes 2..N use `~/.shuffle_autobot_live.laneK.json` and `~/.shuffle_autobot.laneK.pid`, and their log lines carry an `[LK]` prefix. Config file, stats DB and log file are shared. Lane 1 keeps today's paths, log format and `shuffle` unit. Monitor `S` stops `shuffle-lane@K` for lane K > 1 (the unit template ships in E7). A bad `--lane` still exits 1.
+- **Sessions** — each new `sessions` row records its `lane`.
+- **Lane split** — `lanes.split` = `none` (default: full bet, no budget), `budget` (each lane may risk balance ÷ lanes), `bet` (base bet and `basebet_pct` ÷ lanes) or `both`. With a budget, the lane's share is balance ÷ lanes at bot start. Lane equity = share + the lane's closed cycles + the current session profit. When the next bet is larger than the equity, the lane stops with `Lane budget exceeded (…)`; this reason never restarts. The chain-depth warning uses the share. The state file writes `lane`, `lanes_count`, `lane_split`, `lane_share` and `lane_equity`.
+- **Per-lane overrides** — `lanes: {count, split, overrides: {"K": {…}}}` in the config. Load and SIGHUP reload merge lane K's overrides and the bet split over the base config. A lane's own `base_bet` override is never divided, and a split bet that rounds to 0 stays full. `save_config` keeps the `lanes` block and writes the full bet while the split bet is untouched. Lanes 2..N never write the config.
+- **`--config-set`** — `lanes=N`, `lane_split=MODE`, `laneK.key=value`, `laneK.key=default` (also `unset` / `inherit`). Lane values pass the same `_apply_mutation` checks; derived fields come along (e.g. `dice_target` for `multiplier`). These keys are refused per lane: `bearer_token`, `currency`, `game`, `proxy`, `purge_days`, `db_write_mode`. A refused key or bad value exits 2 and leaves the file as it was. Edited lanes get SIGHUP; a base `--config-set` also signals every running lane. `--config-show` prints `Lanes: N  split: MODE` and each lane's overrides.
+- **Start stagger** — lane K waits `(K-1)·2 s` before its first bet.
+- **`--benchmark N --lanes M`** — the read-only `GetMyProfile` probe at 1..M concurrent clients, each with its own client (as each lane process has). Prints req/s, scaling, p50, ok and 429 per count, then `recommend_lanes` (each added lane must gain ≥ 30 %, no 429s).
+- **Service note** — every lane is its own process with its own curl_cffi (or requests) client, and `windowId` is generated fresh per Limbo bet. So lanes share no client state and need no lock.
+- N/A: soft pacing (no quota headers; each lane keeps the 429 / Retry-After backoff), the `/auto/start` lock (no server auto-bet), `pipeline_depth` (no pipeline), ratelimit-header columns in the lanes benchmark. `--lanes-status`, `shufflectl lanes` and the `shuffle-lane@.service` template are E7. With `--preset` the lanes block is not read (lanes run with `--resume`).
+- Tests: `tests/test_wolfbet_sync_e5_lanes.py` (53). The "two lanes" tests run each lane with its own state, one after the other, on one shared fake account: `state` is module-global, one lane per process. `conftest.py` sandboxes the lane-1 base paths and restores the log formatter; `test_portability_v1.py` version pin; the E5 argparse test accepts `lanes`.
+
+`VERSION` `1.9.0` → `1.10.0`.
+
 ## CLI v1.9.0 — Observability, retention, proxy, async writer, live editing (2026-11-14)
 
 Mirrors WolfBet CLI v2.17.0 (API / cycle / efficiency metrics), v2.18.0 (wizard Step 5b + preset keys), v2.19.0 (`T` tweak + `_apply_mutation`), v2.22.1 / v2.32.1 (`_check_risky_config` incl. chain depth), v2.25.0 (`--config-show` / `--config-set` / `--version`), v2.26.0 (proxy, `purge_days`, `--cleanup`), v2.26.1 (`--benchmark` / `--diagnose`), v2.27.0 (async bet writer), v2.28.1 (monitor footer hints, systemd-aware stop) and v2.30.3–v2.30.5 (windowed metrics). TG unchanged. GraphQL documents, string amounts and `windowId` unchanged.
