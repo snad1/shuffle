@@ -689,7 +689,7 @@ def test_argparse_version_and_dispatch(monkeypatch, capsys):
         monkeypatch.setattr(sh, fn, lambda *a, _f=fn: calls.append((_f, a)))
         monkeypatch.setattr(sh.sys, "argv", ["shuffle.py", flag])
         sh.main()
-    monkeypatch.setattr(sh, "cmd_benchmark", lambda n: calls.append(("bench", n)))
+    monkeypatch.setattr(sh, "cmd_benchmark", lambda n, lanes=None: calls.append(("bench", n)))
     monkeypatch.setattr(sh, "cmd_cleanup", lambda d: calls.append(("clean", d)))
     monkeypatch.setattr(sh, "cmd_config_set", lambda p: calls.append(("set", p)))
     for argv in (["--benchmark"], ["--benchmark", "7"], ["--cleanup"], ["--cleanup", "4"],

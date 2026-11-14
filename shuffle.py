@@ -21,7 +21,11 @@ from shared.core.stats import stats_date_window, fmt_duration, sessions_time_spa
 from shared.core.database import ensure_sessions_lane, cleanup_old_bets, cleanup_live_bets
 from shared.core.diagnostics import percentile, benchmark_verdict
 from shared.core.net import validate_proxy, mask_proxy
-from shared.core.lanes import validate_lane
+from shared.core.lanes import (
+    LANES_MAX, LANE_SPLIT_HELP, LANE_UNSET_VALUES, check_lane_keys, lane_budget_exceeded,
+    lane_config, lane_equity, lane_path, lane_share, lane_split, lanes_count,
+    recommend_lanes, split_bet_divisor, split_budget_on, split_lane_pairs, validate_lane,
+)
 try:
     import readline
 except ImportError:
@@ -83,7 +87,7 @@ STATE_PATH   = os.path.expanduser("~/.shuffle_autobot_live.json")
 PID_PATH     = os.path.expanduser("~/.shuffle_autobot.pid")
 PRESET_PATH  = os.path.expanduser("~/.shuffle_presets.json")
 LOG_DIR      = os.path.expanduser("~/.shuffle_logs")
-VERSION      = "1.9.0"
+VERSION      = "1.10.0"
 MIN_BET      = 0.001   # Shuffle minimum bet
 APP_ENV      = os.environ.get("APP_ENV", "production")
 
@@ -100,6 +104,15 @@ _log_handler.setFormatter(logging.Formatter(
     "%(asctime)s  %(levelname)-7s  %(message)s", datefmt="%Y-%m-%d %H:%M:%S"
 ))
 logger.addHandler(_log_handler)
+
+# v1.10.0 — parallel lanes (WolfBet v2.35.0). Lane 1 keeps these paths; lanes
+# 2..N get `.laneK` state / pid files. Config file, DB and log file are shared.
+_BASE_STATE_PATH, _BASE_PID_PATH = STATE_PATH, PID_PATH
+
+# Keys that can't differ per lane: one account, one client setup, one DB.
+_LANE_FORBIDDEN_KEYS = frozenset({
+    "bearer_token", "currency", "game", "proxy", "purge_days", "db_write_mode",
+})
 
 CURRENCIES = ["btc", "eth", "ltc", "doge", "trx", "bch", "xrp", "usdt", "bnb", "ada", "matic", "shib"]
 
@@ -441,11 +454,29 @@ def _mask_key(key: str) -> str:
         return "***"
     return f"{key[:8]}...{key[-4:]}"
 
-def save_config():
-    data = _serialize_keys(_CONFIG_KEYS)
+def _write_config_raw(data: dict) -> None:
     fd = os.open(CONFIG_PATH, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, "w") as f:
         json.dump(data, f, indent=2)
+
+
+def save_config():
+    # v1.10.0 — the base config is lane 1's; lanes 2..N never write it.
+    if state.lane > 1:
+        logger.info("save_config skipped on lane %d (base config is lane 1's)", state.lane)
+        return
+    data = _serialize_keys(_CONFIG_KEYS)
+    # An untouched split bet is saved as the full bet, so a reload doesn't split it twice.
+    if state.base_bet_split is not None and state.base_bet == state.base_bet_split:
+        data["base_bet"] = state.base_bet_disk
+    try:
+        with open(CONFIG_PATH) as f:
+            old = json.load(f)
+        if isinstance(old, dict) and "lanes" in old:
+            data["lanes"] = old["lanes"]
+    except (OSError, ValueError):
+        pass
+    _write_config_raw(data)
     logger.info("Config saved (token=%s)", _mask_key(data.get("bearer_token", "")))
 
 def load_config() -> bool:
@@ -454,7 +485,16 @@ def load_config() -> bool:
     try:
         with open(CONFIG_PATH) as f:
             data = json.load(f)
-        _apply_loaded(data, _CONFIG_KEYS)
+        # v1.10.0 — lane overrides and the lane bet split go over the base config.
+        state.lanes_count = lanes_count(data)
+        state.lane_split = lane_split(data)
+        merged, warn = lane_config(data, state.lane, _LANE_FORBIDDEN_KEYS)
+        if warn:
+            logger.warning(warn)
+        state.base_bet_disk = data.get("base_bet")
+        mb = merged.get("base_bet")
+        state.base_bet_split = mb if mb != state.base_bet_disk else None
+        _apply_loaded(merged, _CONFIG_KEYS)
         return True
     except Exception:
         return False
@@ -501,6 +541,9 @@ def _reload_live_config() -> dict:
     except Exception as e:
         logger.warning("live reload: failed to parse config: %s", e)
         return {}
+    # v1.10.0 — merge this lane's overrides and bet split (WolfBet v2.35.0 / v2.36.0).
+    # The lane count and split mode themselves apply on the next start.
+    data, _ = lane_config(data, state.lane, _LANE_FORBIDDEN_KEYS)
     applied, skipped = {}, []
     tuple_keys = set(_STREAK_TUPLE_KEYS)
     with state.lock:
@@ -1093,9 +1136,50 @@ class BotState:
         self.purge_days   : int = 3
         self.db_write_mode: str = "async"
 
+        # -- v1.10.0 parallel lanes (WolfBet v2.35.0 / v2.36.0) --
+        self.lane            : int = 1
+        self.lanes_count     : int = 1
+        self.lane_split      : str = "none"
+        self.lane_share      : Optional[float] = None   # None = no lane budget
+        self.lane_run_profit : float = 0.0               # closed cycles of this run
+        self.base_bet_disk   : Optional[float] = None    # base_bet as saved on disk
+        self.base_bet_split  : Optional[float] = None    # base_bet after the lane bet split
+
 
 state   = BotState()
 console = Console()
+
+
+# ===========================================================
+#  LANES  (v1.10.0 — WolfBet v2.35.0 / v2.36.0)
+# ===========================================================
+def _apply_lane(lane) -> None:
+    """Select lane K before any command: state / pid paths and the `[LK]` log prefix.
+
+    Lane 1 keeps the classic paths and log format.
+    """
+    global STATE_PATH, PID_PATH
+    lane = validate_lane(lane)
+    state.lane = lane
+    if lane > 1:
+        STATE_PATH = lane_path(_BASE_STATE_PATH, lane)
+        PID_PATH = lane_path(_BASE_PID_PATH, lane)
+        _log_handler.setFormatter(logging.Formatter(
+            f"%(asctime)s  %(levelname)-7s  [L{lane}] %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S"))
+
+
+def _lane_equity():
+    """Money this lane may still risk (share + its result), None without a budget split."""
+    return lane_equity(state.lane_share, state.lane_run_profit, state.profit)
+
+
+def _init_lane_budget() -> None:
+    """Set this lane's share of the balance at bot start (`budget` / `both` split only)."""
+    state.lane_share = lane_share(state.current_balance, state.lanes_count, state.lane_split)
+    if state.lane_share is not None:
+        logger.warning("LANE %d/%d share=%.8f %s (split %s)", state.lane, state.lanes_count,
+                       state.lane_share, state.currency.upper(), state.lane_split)
 
 
 # ===========================================================
@@ -1250,10 +1334,14 @@ def _check_risky_config() -> list:
             "on a bad streak. Consider `t maxloss <amount>` (or set it in the wizard) "
             "to establish a floor."
         )
-    depth = martingale_chain_depth(bal, float(state.base_bet or 0), loss_mult)
+    # v1.10.0 — with a lane budget only the lane's share backs the chain.
+    lane_budget = split_budget_on(state.lanes_count, state.lane_split)
+    bank = bal / state.lanes_count if lane_budget else bal
+    depth = martingale_chain_depth(bank, float(state.base_bet or 0), loss_mult)
     if sk in ("2", "6") and state.streak_reset_losses and state.max_loss is None and depth:
         warnings.append(
-            f"Streak reset with no `max_loss`: balance covers a {depth}-loss chain. "
+            f"Streak reset with no `max_loss`: {'lane share' if lane_budget else 'balance'} "
+            f"covers a {depth}-loss chain. "
             f"Loss {depth + 1} in a row ends the session with insufficient balance."
         )
     if sk == "3" and state.max_profit is None:
@@ -1735,6 +1823,10 @@ def should_stop() -> tuple:
     if streak_reset_triggered(state.current_streak, state.last_broken_loss_streak,
                               state.streak_reset_losses, p):
         return True, streak_reset_stop_reason(state.last_broken_loss_streak)
+    # v1.10.0 — lane budget (WolfBet v2.35.0). Not on the restart whitelist.
+    over, reason = lane_budget_exceeded(state.current_bet, _lane_equity())
+    if over:
+        return True, reason
     return False, ""
 
 
@@ -1742,7 +1834,9 @@ def _apply_basebet_pct() -> bool:
     """Recompute base_bet as basebet_pct × balance. Returns True if it changed."""
     if state.basebet_pct <= 0 or state.current_balance <= 0:
         return False
-    new_base = round(state.current_balance * state.basebet_pct, 8)
+    # v1.10.0 — the lane bet split divides it too (WolfBet v2.36.0).
+    new_base = round(state.current_balance * state.basebet_pct
+                     / split_bet_divisor(state.lanes_count, state.lane_split), 8)
     if new_base <= 0 or abs(new_base - state.base_bet) < 1e-12:
         return False
     with state.lock:
@@ -1805,6 +1899,7 @@ def _reset_session_for_recurring(delay: float) -> None:
         state.total_bets     = 0
         state.wins           = 0
         state.losses         = 0
+        state.lane_run_profit += state.profit   # lane equity spans its cycles
         state.profit         = 0.0
         state.wagered        = 0.0
         state.current_streak = 0
@@ -2059,12 +2154,12 @@ def _db_start_session() -> int:
     c = conn.cursor()
     c.execute("""
         INSERT INTO sessions
-            (started_at, currency, game, strategy, base_bet, multiplier, start_balance)
-        VALUES (?,?,?,?,?,?,?)
+            (started_at, currency, game, strategy, base_bet, multiplier, start_balance, lane)
+        VALUES (?,?,?,?,?,?,?,?)
     """, (
         datetime.now().isoformat(),
         state.currency, state.game, state.strategy,
-        state.base_bet, state.multiplier_target, state.start_balance,
+        state.base_bet, state.multiplier_target, state.start_balance, state.lane,
     ))
     conn.commit()
     sid = c.lastrowid
@@ -2332,6 +2427,12 @@ def _save_state_file():
             # v1.9.0 — observability (WolfBet v2.17.0 / v2.30.3-v2.30.5 / v2.27.0)
             **_metrics_state_dict(),
             "purge_days": state.purge_days,
+            # v1.10.0 lanes (WolfBet v2.35.0 / v2.36.0)
+            "lane": state.lane,
+            "lanes_count": state.lanes_count,
+            "lane_split": state.lane_split,
+            "lane_share": state.lane_share,
+            "lane_equity": _lane_equity(),
             "proxy": mask_proxy(state.proxy) if state.proxy else "direct",
             "status": state.status,
             "last_error": state.last_error,
@@ -4353,13 +4454,18 @@ def cmd_status():
 SYSTEMD_UNIT = "shuffle"
 
 
+def _systemd_unit() -> str:
+    """This lane's unit: `shuffle` for lane 1, `shuffle-lane@K` for lanes 2..N."""
+    return SYSTEMD_UNIT if state.lane <= 1 else f"{SYSTEMD_UNIT}-lane@{state.lane}"
+
+
 def _is_systemd_managed(pid) -> bool:
-    """True when pid runs inside the shuffle systemd unit (cgroup check)."""
+    """True when pid runs inside this lane's shuffle systemd unit (cgroup check)."""
     if not pid:
         return False
     try:
         with open(f"/proc/{pid}/cgroup", "r") as f:
-            return f"{SYSTEMD_UNIT}.service" in f.read()
+            return f"{_systemd_unit()}.service" in f.read()
     except OSError:
         return False
 
@@ -4937,7 +5043,7 @@ def cmd_monitor():
             if _is_systemd_managed(pid):
                 try:
                     import subprocess as _sp
-                    _sp.run(["systemctl", "--user", "stop", SYSTEMD_UNIT],
+                    _sp.run(["systemctl", "--user", "stop", _systemd_unit()],
                             check=False, timeout=10)
                     stopped_via_systemd = True
                 except Exception:
@@ -5079,6 +5185,7 @@ def cmd_config_show():
     for field, desc in _CONFIG_SHOW_FIELDS:
         tbl.add_row(field, _fmt_config_value(field, getattr(state, field, None)), desc)
     console.print(tbl)
+    _print_lanes_config()
     try:
         st = os.stat(CONFIG_PATH)
         console.print(f"\n[dim]Config file:[/] [cyan]{CONFIG_PATH}[/]  "
@@ -5086,6 +5193,129 @@ def cmd_config_show():
     except OSError:
         pass
     console.print("[dim]Tweak with:[/] [cyan]python3 shuffle.py --config-set KEY=VALUE …[/]")
+
+
+def _read_config_raw() -> dict:
+    try:
+        with open(CONFIG_PATH) as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _print_lanes_config() -> None:
+    """--config-show: lane count, split mode and per-lane overrides (WolfBet v2.35.0 / v2.36.0)."""
+    raw = _read_config_raw()
+    n, mode = lanes_count(raw), lane_split(raw)
+    line = f"\n[bold]Lanes:[/] [cyan]{n}[/]  [bold]split:[/] [cyan]{mode}[/]"
+    if n > 1:
+        line += f"  [dim]({LANE_SPLIT_HELP[mode]})[/]"
+    console.print(line)
+    overrides = (raw.get("lanes") or {}).get("overrides") or {}
+    for k in range(2, LANES_MAX + 1):
+        ov = overrides.get(str(k)) if isinstance(overrides, dict) else None
+        if isinstance(ov, dict) and ov:
+            pairs = ", ".join(f"{key}={val}" for key, val in ov.items())
+            console.print(f"  [yellow]lane{k} overrides:[/] {pairs}")
+
+
+def _signal_lane_daemons(lanes=None) -> int:
+    """SIGHUP running lane daemons (default: lanes 2..N) via their pid files; return the count."""
+    if not hasattr(signal, "SIGHUP"):
+        return 0
+    sent = 0
+    for k in (lanes if lanes is not None else range(2, LANES_MAX + 1)):
+        try:
+            with open(lane_path(_BASE_PID_PATH, k)) as f:
+                os.kill(int(f.read().strip()), signal.SIGHUP)
+            sent += 1
+        except (OSError, ValueError):
+            continue
+    return sent
+
+
+def _lane_override_changes(pairs: list):
+    """Lane pairs → ({key: stored value}, [keys to remove]). Raises ValueError.
+
+    Values go through the same `_apply_mutation` checks as base keys, against the
+    base config; derived fields (e.g. dice_target) come along. A key set
+    explicitly is kept even when it equals the base value.
+    """
+    removals, rest = [], []
+    for pair in pairs:
+        key, val = pair.split("=", 1)
+        key = key.strip().lower()
+        canonical = _TWEAK_ALIAS.get(key, key)
+        check_lane_keys([key, canonical], _LANE_FORBIDDEN_KEYS)
+        if val.strip().lower() in LANE_UNSET_VALUES:
+            removals.append(canonical)
+        else:
+            rest.append(f"{canonical}={val}")
+    parsed = _parse_config_set_pairs(rest) if rest else {}
+    check_lane_keys(parsed, _LANE_FORBIDDEN_KEYS)
+    if not parsed:
+        return {}, removals
+    lane = state.lane
+    state.lane = 1                      # validate against the base config
+    try:
+        if not load_config():
+            raise ValueError("no config saved yet — run the wizard first")
+        before = _serialize_keys(_CONFIG_KEYS)
+        _apply_mutation(parsed)
+        after = _serialize_keys(_CONFIG_KEYS)
+    finally:
+        state.lane = lane
+    changes = {k: after[k] for k in after
+               if (after[k] != before[k] or k in parsed) and k not in _LANE_FORBIDDEN_KEYS}
+    return changes, removals
+
+
+def _cmd_config_set_lanes(per_lane: dict, count, split) -> None:
+    """Write `lanes.count`, `lanes.split` and per-lane overrides; SIGHUP the edited lanes."""
+    raw = _read_config_raw()
+    if not raw:
+        console.print("[yellow]No config saved yet — run the wizard first.[/]")
+        sys.exit(1)
+    try:
+        edits = {k: _lane_override_changes(v) for k, v in sorted(per_lane.items())}
+    except ValueError as e:
+        console.print(f"[red]Invalid lane setting:[/] {e}")
+        sys.exit(2)
+    block = raw.setdefault("lanes", {})
+    if not isinstance(block, dict):
+        block = raw["lanes"] = {}
+    overrides = block.setdefault("overrides", {})
+    console.print(Rule("[bold cyan]Lanes updated[/]"))
+    if count is not None:
+        console.print(f"  [yellow]lanes[/]: [dim]{lanes_count(raw)}[/]  →  [green]{count}[/]")
+        block["count"] = count
+    if split is not None:
+        console.print(f"  [yellow]lane_split[/]: [dim]{lane_split(raw)}[/]  →  [green]{split}[/]"
+                      f"  [dim]({LANE_SPLIT_HELP[split]})[/]")
+        block["split"] = split
+    for k, (changes, removals) in edits.items():
+        ov = overrides.setdefault(str(k), {})
+        for key in removals:
+            if ov.pop(key, None) is not None:
+                console.print(f"  [yellow]lane{k}.{key}[/]: override removed (uses base)")
+        for key, val in changes.items():
+            ov[key] = val
+            console.print(f"  [yellow]lane{k}.{key}[/]: [green]{val}[/]")
+        if not ov:
+            overrides.pop(str(k), None)
+    _write_config_raw(raw)
+    console.print(f"\n[dim]Saved to[/] [cyan]{CONFIG_PATH}[/]")
+    if edits:
+        n = _signal_lane_daemons(list(edits))
+        if n:
+            console.print(f"[dim]Reloaded {n} running lane(s).[/]")
+    if count is not None:
+        console.print(f"[yellow]Note:[/] start / stop lanes to match: run each lane with "
+                      f"[cyan]python3 shuffle.py --daemon --resume --lane K[/] (shufflectl lanes is E7).")
+    elif split is not None:
+        console.print("[yellow]Note:[/] the split applies on the next start of each lane. "
+                      "Run [cyan]shufflectl restart[/] when ready.")
 
 
 def _parse_config_set_pairs(pairs: list) -> dict:
@@ -5111,6 +5341,16 @@ def cmd_config_set(pairs: list):
             console.print("[dim]  Set it with the wizard (--setup-only) so it never lands "
                           "in shell history / process args.[/]")
             sys.exit(2)
+    # v1.10.0 — lanes=N, lane_split=MODE and laneK.key=value (WolfBet v2.35.0 / v2.36.0).
+    try:
+        pairs, per_lane, count, split = split_lane_pairs(pairs)
+    except ValueError as e:
+        console.print(f"[red]Invalid --config-set argument:[/] {e}")
+        sys.exit(2)
+    if per_lane or count is not None or split is not None:
+        _cmd_config_set_lanes(per_lane, count, split)
+        if not pairs:
+            return
     try:
         parsed = _parse_config_set_pairs(pairs)
     except ValueError as e:
@@ -5154,6 +5394,11 @@ def cmd_config_set(pairs: list):
         console.print("[dim]Daemon reloaded live config.[/]")
     except (OSError, ValueError):
         console.print("[dim]Daemon PID stale; changes apply on next start.[/]")
+    finally:
+        # v1.10.0 — lanes 2..N read the same base config.
+        n = _signal_lane_daemons()
+        if n:
+            console.print(f"[dim]Reloaded {n} running lane(s).[/]")
 
 
 # ===========================================================
@@ -5204,16 +5449,83 @@ def _retention_worker():
 # ===========================================================
 #  BENCHMARK / DIAGNOSE  (v1.9.0 — WolfBet v2.26.1)
 # ===========================================================
-def cmd_benchmark(n=None):
+def _bench_lanes(n: int, lanes: int) -> dict:
+    """`lanes` threads, each with its own client (as each lane process has), firing
+    n read-only GetMyProfile queries at once. Returns rps / p50 / ok / total / s429."""
+    payload = _gql_payload(_PROFILE_QUERY, {}, "GetMyProfile")
+    lock = threading.Lock()
+    samples, agg = [], {"ok": 0, "s429": 0}
+
+    def worker():
+        sess = _create_http()
+        try:
+            for _ in range(n):
+                t0 = time.time()
+                try:
+                    r = sess.post(API_URL, headers=_headers(), json=payload, timeout=15)
+                    ms = (time.time() - t0) * 1000
+                    with lock:
+                        samples.append(ms)
+                        if r.status_code == 200:
+                            agg["ok"] += 1
+                        elif r.status_code == 429:
+                            agg["s429"] += 1
+                except Exception:
+                    pass
+        finally:
+            try:
+                sess.close()
+            except Exception:
+                pass
+
+    threads = [threading.Thread(target=worker, daemon=True) for _ in range(lanes)]
+    t0 = time.time()
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    wall = max(time.time() - t0, 1e-6)
+    samples.sort()
+    return {"rps": len(samples) / wall, "p50": percentile(samples, 0.50) if samples else 0.0,
+            "ok": agg["ok"], "total": n * lanes, "s429": agg["s429"]}
+
+
+def cmd_benchmark_lanes(n: int, lanes: int) -> None:
+    """--benchmark --lanes M (WolfBet v2.35.0): throughput at 1..M concurrent clients."""
+    lanes = max(2, min(LANES_MAX, int(lanes)))
+    console.print(f"[dim]Benchmarking 1..{lanes} concurrent clients × {n} GetMyProfile "
+                  f"(read-only) (proxy={mask_proxy(state.proxy)}) …[/]")
+    rows = {k: _bench_lanes(n, k) for k in range(1, lanes + 1)}
+    base = rows[1]["rps"]
+    tbl = Table(title="Concurrent clients", title_style="bold cyan")
+    for col in ("lanes", "req/s", "×1 lane", "p50 ms", "ok", "429"):
+        tbl.add_column(col, justify="right")
+    for k, r in rows.items():
+        tbl.add_row(str(k), f"{r['rps']:.1f}", f"{(r['rps'] / base if base else 0):.2f}",
+                    f"{r['p50']:.0f}", f"{r['ok']}/{r['total']}",
+                    f"[red]{r['s429']}[/]" if r["s429"] else "0")
+    console.print(tbl)
+    rec = recommend_lanes(base, {k: v for k, v in rows.items() if k > 1})
+    console.print(f"\n[bold]Recommended lanes:[/] [bold magenta]{rec}[/]  "
+                  f"[dim](each added lane must gain ≥ 30% throughput, no 429s)[/]")
+    console.print("[dim]The probe is the read-only GetMyProfile query; the bet mutations "
+                  "may be rate limited differently. Set it with "
+                  "[cyan]python3 shuffle.py --config-set lanes=N[/].[/]")
+
+
+def cmd_benchmark(n=None, lanes=None):
     """Fire N read-only GetMyProfile queries and report the latency spread.
 
     Same `_http` session (proxy, TLS impersonation) as betting. No bet, no DB write.
+    With lanes > 1, also measure 1..lanes concurrent clients.
     """
     n = 20 if n is None else int(n)
     n = max(3, min(200, n))
     if not load_config():
         console.print("[red]No config saved yet — run the wizard first.[/]")
         sys.exit(1)
+    if lanes is not None and int(lanes) > 1:
+        return cmd_benchmark_lanes(n, lanes)
     console.print(f"[dim]Benchmarking {n} × GetMyProfile (read-only) "
                   f"(proxy={mask_proxy(state.proxy)}) …[/]")
     payload = _gql_payload(_PROFILE_QUERY, {}, "GetMyProfile")
@@ -5362,6 +5674,9 @@ def main():
             "  shuffle.py --benchmark 20\n"
             "  shuffle.py --diagnose\n"
             "  shuffle.py --cleanup 7\n"
+            "  shuffle.py --config-set lanes=2 lane_split=budget lane2.max_wins=5\n"
+            "  shuffle.py --daemon --resume --lane 2\n"
+            "  shuffle.py --benchmark 20 --lanes 4\n"
         ),
     )
     parser.add_argument("--version", action="version", version=f"Shuffle AutoBot v{VERSION}")
@@ -5397,13 +5712,26 @@ def main():
                         help="With --stats/--analytics: window end, same formats "
                              "(bare date = inclusive end of day)")
     parser.add_argument("--lane", type=int, metavar="K", default=None,
-                        help="With --stats/--analytics: only that parallel lane's sessions (1-10)")
+                        help="Parallel lane to run or inspect (1-10, default 1): own state / pid "
+                             "files and [LK] log prefix; with --stats/--analytics only that "
+                             "lane's sessions")
+    parser.add_argument("--lanes", type=int, metavar="M", default=None,
+                        help="With --benchmark: also probe 1..M concurrent clients (2-10) "
+                             "and recommend a lane count")
     parser.add_argument("--preset", type=str, metavar="NAME",
                         help="Load a named preset and start (skips wizard)")
     parser.add_argument("--verbose", action="store_true",
                         help="Enable debug logging (dev mode)")
 
     args = parser.parse_args()
+
+    # v1.10.0 — pick the lane before any command so --status / --stop / --monitor /
+    # --diagnose act on that lane's files.
+    try:
+        _apply_lane(args.lane)
+    except ValueError as e:
+        console.print(f"[red]{e}[/]")
+        sys.exit(1)
 
     if args.verbose:
         logger.setLevel(logging.DEBUG)
@@ -5430,18 +5758,12 @@ def main():
         cmd_diagnose()
         return
     if args.benchmark is not None:
-        cmd_benchmark(args.benchmark)
+        cmd_benchmark(args.benchmark, lanes=args.lanes)
         return
     if args.cleanup is not None:
         init_db()
         cmd_cleanup(None if args.cleanup == -1 else args.cleanup)
         return
-    if args.lane is not None:
-        try:
-            validate_lane(args.lane)
-        except ValueError as e:
-            console.print(f"[red]{e}[/]")
-            sys.exit(1)
     if args.stats:
         cmd_stats(since=args.since, until=args.until, lane=args.lane)
         return
@@ -5495,6 +5817,11 @@ def main():
         _load_and_connect()
     else:
         setup_wizard()
+
+    # v1.10.0 — lane share at start, then stagger lane K's first bet (K-1)·2 s.
+    _init_lane_budget()
+    if state.lane > 1:
+        time.sleep((state.lane - 1) * 2.0)
 
     state.session_id    = _db_start_session()
     state.session_start = time.time()
