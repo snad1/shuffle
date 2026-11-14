@@ -42,7 +42,8 @@ usage() {
     echo "    shufflectl tmux        Run monitor in a detachable tmux session"
     echo ""
     echo "  DATA:"
-    echo "    shufflectl stats       Show all-time session statistics"
+    echo "    shufflectl stats       Show session statistics [--since D] [--until D] [--lane K]"
+    echo "    shufflectl analytics   Lifetime analytics by game/strategy/lane [--since D] [--until D] [--lane K]"
     echo "    shufflectl session ID  Full stats + streak distribution for a session"
     echo "    shufflectl presets     List saved presets"
     echo "    shufflectl update      Update bot from current directory"
@@ -163,6 +164,10 @@ cmd_tmux() {
 
 cmd_stats() {
     "$PYTHON" "$BOT" --stats "$@"
+}
+
+cmd_analytics() {
+    "$PYTHON" "$BOT" --analytics "$@"
 }
 
 cmd_session() {
@@ -468,6 +473,7 @@ case "${1:-}" in
     interactive)  cmd_interactive ;;
     tmux)         cmd_tmux ;;
     stats)        cmd_stats "${@:2}" ;;
+    analytics)    cmd_analytics "${@:2}" ;;
     session)      cmd_session "${2:-}" ;;
     presets)      cmd_presets ;;
     update)       cmd_update ;;
