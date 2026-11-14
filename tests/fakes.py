@@ -13,7 +13,8 @@ Speaks the real GraphQL shape the clients parse (shuffle.py and tg/engine.py
     GetMyProfile -> data.me.account.balances[] with both `amount` (CLI alias)
     and `availableAmount` (TG). Never consumes the script.
 
-Script outcomes: win, loss, insufficient_balance, http_429, timeout.
+Script outcomes: win, loss, insufficient_balance, http_429, timeout,
+api_error_balance.
 An empty script answers insufficient_balance and sets `exhausted`.
 Timeouts surface as requests Timeout (CLI) / httpx.ReadTimeout (TG httpx path).
 """
@@ -26,7 +27,8 @@ import httpx
 import requests
 
 API_URL = "https://shuffle.com/main-api/graphql/api/graphql"
-OUTCOMES = {"win", "loss", "insufficient_balance", "http_429", "timeout"}
+OUTCOMES = {"win", "loss", "insufficient_balance", "http_429", "timeout",
+            "api_error_balance"}
 BET_OPS = {"LimboPlay": "limboPlay", "DicePlay": "dicePlay"}
 
 
@@ -85,6 +87,10 @@ class FakeCasino:
             raise FakeTimeout()
         if outcome == "http_429":
             return 429, {"message": "Too many requests"}
+        if outcome == "api_error_balance":
+            # A rejection that mentions "balance" but is not insufficient funds.
+            return 200, {"errors": [{"message": "Balance currency not supported"}],
+                         "data": None}
         if outcome == "insufficient_balance" or amount > self.balance:
             return 200, {"errors": [{"message": "Insufficient balance",
                                      "extensions": {"code": "INSUFFICIENT_BALANCE"}}],

@@ -78,6 +78,10 @@ def format_full_config(s: dict) -> list:
     sbl = s.get("streakbet_loss")
     if sbl and sbl[0] > 0:
         lines.append(f"  Streak bet loss: every `{sbl[0]}` losses → `x{sbl[1]:.3f}`")
+    sr = s.get("streak_reset_losses")
+    if sr:
+        srd = s.get("streak_reset_delay")
+        lines.append(f"  Streak reset: `SR {sr}L→{int(srd) if srd is not None else 600}s`")
 
     pipe = s.get("pipeline", 1)
     if pipe and pipe > 1:

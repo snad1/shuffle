@@ -1,5 +1,20 @@
 # Changelog
 
+## TG v1.9.0 — Streak reset, delay caps, analytics window (2026-11-14)
+
+Mirrors WolfBet TG 1.20.0: v2.30.6 (delay cap), v2.32.0 (streak reset), v2.32.1 (insufficient balance terminal), v2.33.0 (time-of-day window). CLI unchanged. GraphQL documents unchanged.
+
+- **Streak reset** — `/set srloss N` (alias `streakreset`, `off` to disable) stops the session on the first win after N+ consecutive losses, only while profit ≥ 0. The bot then starts a new session (new `sessions` row) after `/set srdelay S` (alias `streakresetdelay`, default 600 s, 5–86400), **even when `recurring` is off**. Live `/set srloss|srdelay` carries into the next cycle; the bumped `base_bet` is kept and `next_profit_milestone` re-arms from `profit_threshold`. The streak is recorded where the win/loss is decided, before the bet is queued and before the profit-increment step. Uses `shared.core.session_rules` (`record_outcome`, `streak_reset_triggered`, `STREAK_RESET_REASON`).
+- **Delay caps** — `/set recdelay` and `/set srdelay` clamp to 5..86400 and tell you when they clamp. A saved `recurring_delay` above 24 h is capped at the restart.
+- **`/tweak`** gains `srloss` (live on the running engine) and `srdelay` / `recdelay` (saved; apply at the next stop).
+- **`/config`, `/status`, stop message** show `Streak reset … / SR nL→Ss` when set; `/help` lists the keys; web settings page lists `streak_reset_losses` / `streak_reset_delay`; both keys are in `CONFIG_KEYS` (presets) and the `/resume` snapshot.
+- **`/analytics`** builds its window with `shared.core.stats.stats_date_window`: `/analytics 2026-11-13 14:00` now starts at 14:00 instead of matching the whole day (`' ' < 'T'`). A time token after a date joins it, since Telegram splits on spaces. Bad bounds print the usage.
+- **Fix: insufficient-balance match.** The GraphQL `errors` path and the `ConnectionError` path stopped the session on any message containing "balance" (`"insufficient" or "balance"`), the same bug as goated. They now match "insufficient" only, so e.g. a currency error no longer ends the session as insufficient. Insufficient balance stays terminal: no recurring or streak-reset restart. (The CLI has the same match; fixed in its E3 story.)
+- N/A for TG: none of the v2.32.0–v2.33.0 TG items depend on WolfBet-only API features.
+- Tests: `tests/test_wolfbet_sync_e2.py` (28); fake gains `api_error_balance`. `test_portability_v1.py` version pin and the `/analytics` source check updated for the shared helper.
+
+`tg/__init__.py` `1.8.1` → `1.9.0`.
+
 ## CLI v1.6.1 / TG v1.8.1 — casino-shared over HTTPS (2026-11-13)
 
 Mirrors wolfbet v2.16.11 (casino-shared dependency installs over HTTPS). No bot behaviour change.
