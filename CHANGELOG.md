@@ -1,5 +1,20 @@
 # Changelog
 
+## CLI v1.8.0 — Stats windows, durations, analytics, lane filter (2026-11-14)
+
+Mirrors WolfBet CLI v2.23.0 (`--analytics`), v2.30.9 (`--stats --since/--until`), v2.31.0 (date-range analytics), v2.33.0 (time-of-day window fix), v2.33.1 (wins / losses per session), v2.34.0 (durations, time span, run time) and the v2.35.0 stats / analytics lane filter. TG unchanged. GraphQL documents, string amounts and `windowId` unchanged.
+
+- **Window fix** — `--since` / `--until` use `shared.core.stats.stats_date_window`: `--since "2026-11-13 14:00"` now starts at 14:00 instead of matching the whole day (`' ' < 'T'`), a bare `--until` date runs to `23:59:59.999999`, and a bad bound prints `Invalid --since/--until "…"` and no rows. The local `_stats_date_window` is gone.
+- **`--stats` totals** — `Sessions: N  (first → last)`, `Time Span … Bet Time …` (span includes the gaps between cycles, bet time does not; `fmt_duration` format `1mo 2d 3h 4m 5s`), `Wins/Session: Max N Avg N.N`, `Losses/Session: Max N Avg N.N`. All honour the window and lane.
+- **New `--analytics [--since --until --lane K]`** — Overall panel (sessions, time range, time span, bet time, sessions in profit / loss, bets, win rate, wagered, P/L, best / worst session), By game (game labels), By strategy, By lane (only when the window has 2+ lanes), Top 5 best / worst sessions. Reads only `sessions`.
+- **Lanes** — new `--lane K` (1-10) filters `--stats` / `--analytics` on `sessions.lane` (old rows count as lane 1); session headers show `[LK]` for lane 2+. `init_db` adds `sessions.lane` idempotently (`ensure_sessions_lane`), also when `--stats` / `--analytics` open an older DB. Running lanes is not here yet (E5-S7): every new row is lane 1.
+- **Run time** — the dashboard header shows `Run …` (time since the first cycle started, never reset across cycles); `--monitor` shows it from `run_uptime_sec` and omits it for older state files; `--status` gains a `Running for` row.
+- **`shufflectl analytics`** pass-through (args forwarded, like `stats`).
+- N/A: none; every item maps to shuffle's `sessions` table, which has the same columns as WolfBet's.
+- Tests: `tests/test_wolfbet_sync_e4.py` (18); `test_portability_v1.py` window tests moved to the shared helper (until bound `T23:59:59.999999`) and version pin.
+
+`VERSION` `1.7.0` → `1.8.0`.
+
 ## CLI v1.7.0 — Session cycles, streak reset, live reload (2026-11-14)
 
 Mirrors WolfBet CLI v2.16.0 (recurring, streak delays, `streakbet_loss`, `basebet_pct`, milestones), v2.25.3 (`recurring_delay`), v2.28.2 (config persistence), v2.28.3 (SIGHUP reload), v2.28.4 (uptime freeze), v2.30.1 / v2.30.7 (`next_profit_milestone`, `Ms` window), v2.30.6 (delay cap), v2.32.0 (streak reset) and v2.32.1 (insufficient balance terminal). TG unchanged. GraphQL documents, string amounts and `windowId` unchanged.

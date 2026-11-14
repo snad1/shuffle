@@ -48,7 +48,7 @@ def _mk_engine(db):
 
 # ── VERSION ───────────────────────────────────────────────
 def test_cli_version():
-    assert sh.VERSION == "1.7.0"
+    assert sh.VERSION == "1.8.0"
 
 
 def test_tg_version():
@@ -240,22 +240,22 @@ def test_help_mentions_new_commands():
 
 # ── Date-range filters (v1.6.0 / TG v1.8.0) ───────────────
 def test_stats_date_window_empty():
-    assert sh._stats_date_window() == ("", [], "")
-    assert sh._stats_date_window(since=None, until=None) == ("", [], "")
+    assert sh.stats_date_window() == ("", [], "")
+    assert sh.stats_date_window(since=None, until=None) == ("", [], "")
 
 
 def test_stats_date_window_since_only():
-    clause, params, label = sh._stats_date_window(since="2026-08-01")
+    clause, params, label = sh.stats_date_window(since="2026-08-01")
     assert clause == " WHERE started_at >= ?"
     assert params == ["2026-08-01"]
     assert "2026-08-01" in label and "→" in label
 
 
 def test_stats_date_window_until_extended_to_end_of_day():
-    clause, params, _ = sh._stats_date_window(until="2026-08-15")
+    clause, params, _ = sh.stats_date_window(until="2026-08-15")
     assert clause == " WHERE started_at <= ?"
-    assert params == ["2026-08-15T23:59:59"]
-    _, params2, _ = sh._stats_date_window(since="2026-08-01", until="2026-08-15T12:00:00")
+    assert params == ["2026-08-15T23:59:59.999999"]
+    _, params2, _ = sh.stats_date_window(since="2026-08-01", until="2026-08-15T12:00:00")
     assert params2 == ["2026-08-01", "2026-08-15T12:00:00"]
 
 
@@ -293,7 +293,7 @@ def test_argparse_since_until_on_standalone_parser():
     for line in src.splitlines():
         if "--since" in line or "--until" in line:
             assert line.strip().startswith("parser.add_argument")
-    assert 'cmd_stats(since=args.since, until=args.until)' in src
+    assert 'cmd_stats(since=args.since, until=args.until, lane=args.lane)' in src
 
 
 def test_tg_analytics_supports_date_window():
