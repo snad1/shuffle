@@ -1,4 +1,4 @@
-"""Test sandbox + fake casino fixtures (E0-S2).
+"""Test sandbox + fake casino fixtures.
 
 Module top runs before any test imports `shuffle` or `tg`: path constants are
 bound at import from HOME / SHUFFLE_TG_DATA, so they must point at a temp dir
@@ -24,6 +24,8 @@ for _p in (_ROOT, _CASINO):
 _SANDBOX_HOME = tempfile.mkdtemp(prefix="shuffle_home_")
 os.environ["HOME"] = _SANDBOX_HOME
 os.environ["APP_ENV"] = "testing"
+os.environ.setdefault("SHUFFLE_WEB_SECRET_KEY", "test-secret-key-for-the-suite-12345678")
+os.environ.setdefault("SHUFFLE_WEB_ADMIN_PASS", "test-admin-pass-1234")
 os.environ["SHUFFLE_TG_DATA"] = os.path.join(_SANDBOX_HOME, "tg")
 
 import shuffle as sh  # noqa: E402

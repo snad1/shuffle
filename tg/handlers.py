@@ -1,4 +1,4 @@
-"""Telegram command handlers — all bot commands and callback queries.
+"""Telegram command handlers: all bot commands and callback queries.
 
 Shuffle-specific:
   - Auth: bearer_token (not access_token + lockdown_token + cookie)
@@ -31,6 +31,7 @@ from .database import (
     load_presets, save_presets,
 )
 from core.database import init_db, cleanup_old_bets
+from shared.core.validation import finite_float
 from core.strategy import (
     STRATEGIES, STRATEGY_NAMES, STRATEGY_BY_NAME, StrategyRule,
     describe_rule, load_rules_from_text,
@@ -355,15 +356,44 @@ async def cmd_balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ── /config ──────────────────────────────────────────────
 CTL_NAME = "shufflectl"
 REPO_DIR = os.environ.get("BOT_REPO_DIR", "/root/shuffle")
-DEFAULT_OWNER_ID = 680974641
+UPDATE_LOG_NAME = "update.log"
+
+
+def _owner_id() -> int | None:
+    """Configured Telegram owner id, or None when TG_OWNER_ID is missing or not numeric."""
+    owner = os.environ.get("TG_OWNER_ID", "").strip()
+    return int(owner) if owner.isdigit() else None
 
 
 def _is_owner(user_id: int) -> bool:
-    """Telegram user must match TG_OWNER_ID (env var) or the default owner."""
-    owner = os.environ.get("TG_OWNER_ID")
-    if owner and owner.isdigit():
-        return user_id == int(owner)
-    return user_id == DEFAULT_OWNER_ID
+    """True only for the explicitly configured TG_OWNER_ID."""
+    owner = _owner_id()
+    return owner is not None and user_id == owner
+
+def _validated_path(path: str, is_dir: bool) -> bool:
+    return os.path.isabs(path) and (os.path.isdir(path) if is_dir else os.path.isfile(path))
+
+
+def _update_argv(ctl_path: str, repo_dir: str, log_file: str) -> list[str]:
+    """Command for systemd-run: argv only, no shell, every value in its own element."""
+    return [
+        "systemd-run", "--user", "--collect", "--no-block",
+        f"--unit=shuffle-update-{int(time.time())}",
+        "--on-active=2s",
+        f"--working-directory={repo_dir}",
+        f"--property=StandardOutput=append:{log_file}",
+        f"--property=StandardError=append:{log_file}",
+        "--", ctl_path, "update",
+    ]
+
+
+def _prepare_update_log() -> str:
+    """Create the update log under the bot data dir with owner-only permissions."""
+    os.makedirs(DATA_DIR, exist_ok=True)
+    log_file = os.path.join(DATA_DIR, UPDATE_LOG_NAME)
+    fd = os.open(log_file, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    os.close(fd)
+    return log_file
 
 
 async def cmd_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -373,21 +403,21 @@ async def cmd_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Owner only.")
         return
     ctl_path = shutil.which(CTL_NAME) or f"/root/.local/bin/{CTL_NAME}"
-    if not os.path.exists(ctl_path):
+    if not _validated_path(ctl_path, False) or not os.access(ctl_path, os.X_OK):
         await update.message.reply_text(f"{CTL_NAME} not found in PATH.")
         return
-    if not shutil.which("systemd-run"):
-        await update.message.reply_text("systemd-run not found — update manually via SSH.")
+    if not _validated_path(REPO_DIR, True):
+        logger.error("cmd_update: BOT_REPO_DIR is not an absolute existing directory: %r", REPO_DIR)
+        await update.message.reply_text("Repository directory is not configured correctly.")
         return
-    log_file = f"/tmp/{CTL_NAME}-update.log"
-    cmd = [
-        "systemd-run", "--user", "--collect", "--no-block",
-        "--", "bash", "-c",
-        f"echo \"=== Update via /update at $(date -Is) ===\" >> {log_file} 2>&1; "
-        f"sleep 2; cd {REPO_DIR} && {ctl_path} update >> {log_file} 2>&1",
-    ]
+    if not shutil.which("systemd-run"):
+        await update.message.reply_text("systemd-run not found - update manually via SSH.")
+        return
+    log_file = _prepare_update_log()
+    cmd = _update_argv(ctl_path, REPO_DIR, log_file)
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+        result = await asyncio.to_thread(subprocess.run, cmd, capture_output=True,
+                                         text=True, timeout=10)
         if result.returncode != 0:
             err = (result.stderr or result.stdout or "no output").strip()[:300]
             logger.error("cmd_update: systemd-run rc=%d stderr=%s stdout=%s",
@@ -397,7 +427,7 @@ async def cmd_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode="Markdown")
             return
         await update.message.reply_text(
-            f"🔄 Update started — bot will restart in ~2s.\n"
+            f"🔄 Update started: bot will restart in ~2s.\n"
             f"Logs: `cat {log_file}`",
             parse_mode="Markdown")
     except subprocess.TimeoutExpired:
@@ -518,6 +548,14 @@ async def cmd_config(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(msg, parse_mode="Markdown")
 
 
+def _finite(value, cast=float):
+    """Parse a numeric /set value, rejecting nan, inf and fractional integers."""
+    number = finite_float("value", value)
+    if cast is int and not number.is_integer():
+        raise ValueError("value must be a whole number")
+    return cast(number)
+
+
 # ── /set ─────────────────────────────────────────────────
 async def cmd_set(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -557,7 +595,7 @@ async def cmd_set(update: Update, context: ContextTypes.DEFAULT_TYPE):
             config["strategy_key"] = key
             config["strategy"] = STRATEGY_NAMES[key]
         elif param == "multiplier":
-            mult = float(value)
+            mult = _finite(value)
             if mult <= 1.0:
                 await update.message.reply_text("Multiplier must be > 1.0")
                 return
@@ -569,13 +607,13 @@ async def cmd_set(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else:
                 config["dice_target"] = round(wc, 2)
         elif param == "basebet":
-            val = float(value)
+            val = _finite(value)
             if val < 0:
                 await update.message.reply_text("Base bet must be >= 0.")
                 return
             config["base_bet"] = val
         elif param == "dicetarget":
-            config["dice_target"] = float(value)
+            config["dice_target"] = _finite(value)
         elif param in ("dicecondition", "condition"):
             if value.lower() not in ("above", "below"):
                 await update.message.reply_text(
@@ -589,26 +627,26 @@ async def cmd_set(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else:
                 config["dice_target"] = round(wc, 2)
         elif param == "lossmult":
-            val = float(value)
+            val = _finite(value)
             if val < 0:
                 await update.message.reply_text("Loss multiplier must be > 0.")
                 return
             config["loss_mult"] = val
         elif param == "winmult":
-            val = float(value)
+            val = _finite(value)
             if val < 0:
                 await update.message.reply_text("Win multiplier must be > 0.")
                 return
             config["win_mult"] = val
         elif param == "delay":
-            val = float(value)
+            val = _finite(value)
             if val < 0:
                 await update.message.reply_text("Delay must be >= 0.")
                 return
             config["bet_delay"] = val
         elif param == "maxprofit":
             if value.lower() != "off":
-                val = float(value)
+                val = _finite(value)
                 if val < 0:
                     await update.message.reply_text("Max profit must be > 0.")
                     return
@@ -617,7 +655,7 @@ async def cmd_set(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 config["max_profit"] = None
         elif param == "maxloss":
             if value.lower() != "off":
-                val = float(value)
+                val = _finite(value)
                 if val < 0:
                     await update.message.reply_text("Max loss must be > 0.")
                     return
@@ -626,7 +664,7 @@ async def cmd_set(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 config["max_loss"] = None
         elif param == "maxbets":
             if value.lower() != "off":
-                val = int(value)
+                val = _finite(value, int)
                 if val < 0:
                     await update.message.reply_text("Max bets must be > 0.")
                     return
@@ -635,7 +673,7 @@ async def cmd_set(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 config["max_bets"] = None
         elif param == "maxwins":
             if value.lower() != "off":
-                val = int(value)
+                val = _finite(value, int)
                 if val < 0:
                     await update.message.reply_text("Max wins must be > 0.")
                     return
@@ -644,7 +682,7 @@ async def cmd_set(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 config["max_wins"] = None
         elif param == "minbalance":
             if value.lower() != "off":
-                val = float(value)
+                val = _finite(value)
                 if val < 0:
                     await update.message.reply_text("Min balance must be >= 0.")
                     return
@@ -652,18 +690,18 @@ async def cmd_set(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else:
                 config["stop_on_balance"] = None
         elif param == "delaythreshold":
-            config["delay_martin_threshold"] = int(value)
+            config["delay_martin_threshold"] = _finite(value, int)
         elif param in ("milestonebets", "msbets"):
-            config["milestone_bets"] = int(value)
+            config["milestone_bets"] = _finite(value, int)
         elif param in ("milestonewins", "mswins"):
-            config["milestone_wins"] = int(value)
+            config["milestone_wins"] = _finite(value, int)
         elif param in ("milestonelosses", "mslosses"):
-            config["milestone_losses"] = int(value)
+            config["milestone_losses"] = _finite(value, int)
         elif param in ("milestoneprofit", "msprofit"):
-            config["milestone_profit"] = float(value)
+            config["milestone_profit"] = _finite(value)
         elif param in ("profitthreshold", "pt"):
             if value.lower() != "off":
-                val = float(value)
+                val = _finite(value)
                 if val < 0:
                     await update.message.reply_text("Profit threshold must be > 0 (or 'off').")
                     return
@@ -672,7 +710,7 @@ async def cmd_set(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 config["profit_threshold"] = None
         elif param in ("profitincrement", "pi"):
             if value.lower() != "off":
-                val = float(value)
+                val = _finite(value)
                 if val < 0:
                     await update.message.reply_text("Profit increment must be >= 0 (or 'off').")
                     return
@@ -695,20 +733,20 @@ async def cmd_set(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text("Use: `/set recurring on` or `/set recurring off`", parse_mode="Markdown")
                 return
         elif param in ("recurringdelay", "recdelay"):
-            val, note = clamp("recurring_delay", int(value), 5, RECURRING_DELAY_MAX)
+            val, note = clamp("recurring_delay", _finite(value, int), 5, RECURRING_DELAY_MAX)
             config["recurring_delay"] = int(val)
             value = str(int(val))
         elif param in ("streakreset", "srloss"):
             if value.lower() in ("off", "none", "0"):
                 config["streak_reset_losses"] = None
             else:
-                val = int(value)
+                val = _finite(value, int)
                 if val < 1:
                     await update.message.reply_text("Streak reset must be >= 1 losses (or 'off').")
                     return
                 config["streak_reset_losses"] = val
         elif param in ("streakresetdelay", "srdelay"):
-            val, note = clamp("streak_reset_delay", int(value),
+            val, note = clamp("streak_reset_delay", _finite(value, int),
                               STREAK_RESET_DELAY_MIN, RECURRING_DELAY_MAX)
             config["streak_reset_delay"] = int(val)
             value = str(int(val))
@@ -749,7 +787,7 @@ async def cmd_set(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 config["basebet_pct"] = None
             else:
                 try:
-                    val = float(value)
+                    val = _finite(value)
                 except ValueError:
                     await update.message.reply_text("basebet_pct must be a fraction (e.g. `0.001` = 0.1% of balance)", parse_mode="Markdown")
                     return
@@ -758,7 +796,7 @@ async def cmd_set(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     return
                 config["basebet_pct"] = val
         elif param in ("purgedays", "purge_days"):
-            val = int(value)
+            val = _finite(value, int)
             if val < 1 or val > 30:
                 await update.message.reply_text("Purge days must be 1-30.")
                 return
@@ -766,7 +804,7 @@ async def cmd_set(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif param == "proxy":
             if value.lower() in ("off", "none", "direct", "0"):
                 config["proxy"] = None
-                await update.message.reply_text("Proxy disabled — using direct connection.", parse_mode="Markdown")
+                await update.message.reply_text("Proxy disabled: using direct connection.", parse_mode="Markdown")
                 save_user_config(user_id, config)
                 return
             if not (value.startswith("http://") or value.startswith("https://") or value.startswith("socks5://")):
@@ -895,15 +933,15 @@ async def _safe_send(app, chat_id, text, **kwargs):
     """Engine-driven send that swallows flood/network errors to avoid unraised Task exceptions.
 
     On a Markdown parse error, retries once as plain text so the user always
-    sees the notification — preventing silent /status-style outages.
+    sees the notification: preventing silent /status-style outages.
     """
     from telegram.error import RetryAfter, NetworkError, TimedOut
     try:
         await app.bot.send_message(chat_id, text, **kwargs)
     except RetryAfter as e:
-        logger.warning("Telegram flood — dropping notification (retry in %ss)", e.retry_after)
+        logger.warning("Telegram flood: dropping notification (retry in %ss)", e.retry_after)
     except (NetworkError, TimedOut) as e:
-        logger.warning("Telegram network — dropping notification: %s", e)
+        logger.warning("Telegram network: dropping notification: %s", e)
     except BadRequest as e:
         msg = str(e).lower()
         if "parse" in msg or "entity" in msg:
@@ -981,7 +1019,7 @@ async def _notify_stop(chat_id: int, user_id: int, slot: int, reason: str, app):
     # Re-read the saved config at stop time so toggling /set recurring on/off applies to every session.
     rec = user_rec.get(slot)
     # Streak reset (first win after N+ losses, profit >= 0) is its own restart
-    # rule with its own delay — independent of the recurring flag (WolfBet v2.32.0).
+    # rule with its own delay: independent of the recurring flag (WolfBet v2.32.0).
     is_streak_reset = reason.startswith(STREAK_RESET_REASON)
     try:
         live_config = load_user_config(user_id)
@@ -1024,7 +1062,7 @@ async def _notify_stop(chat_id: int, user_id: int, slot: int, reason: str, app):
         task.add_done_callback(_log_task_exception)
         rec["timer_task"] = task
     elif rec and not recurring_on:
-        # User turned recurring off — clean up the snapshot so it doesn't linger
+        # User turned recurring off: clean up the snapshot so it doesn't linger
         recurring_state.get(user_id, {}).pop(slot, None)
 
 
@@ -1089,11 +1127,11 @@ async def _recurring_restart(chat_id: int, user_id: int, old_slot: int,
 
     if not await engine.start():
         err = engine.last_error or "unknown error"
-        logger.warning("Recurring restart failed for user %d slot %d: %s — retrying in %ds",
+        logger.warning("Recurring restart failed for user %d slot %d: %s: retrying in %ds",
                        user_id, old_slot, err, delay)
         await _safe_send(app, chat_id,
-                         f"⚠️ Recurring restart failed: {err}\nRetrying in {delay}s…")
-        # Re-schedule retry — keep recurring state alive (don't pop)
+                         f"⚠️ Recurring restart failed: {err}\nRetrying in {delay}s...")
+        # Re-schedule retry: keep recurring state alive (don't pop)
         rec = user_rec.get(old_slot)
         if rec:
             retry_task = asyncio.create_task(
@@ -1466,11 +1504,11 @@ async def _monitor_loop(msg, user_id: int, slot: int, interval: int):
                         ]])
                         try:
                             await msg.edit_text(
-                                "⏳ Session ended. Recurring restart pending…",
+                                "⏳ Session ended. Recurring restart pending...",
                                 reply_markup=keyboard)
                         except Exception:
                             pass
-                        continue  # keep looping — new engine will appear after restart
+                        continue  # keep looping: new engine will appear after restart
                 try:
                     await msg.edit_text(
                         "Session ended. Monitor stopped.",
@@ -1605,7 +1643,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 ]])
                 try:
                     await query.edit_message_text(
-                        "⏳ Session ended. Recurring restart pending…",
+                        "⏳ Session ended. Recurring restart pending...",
                         reply_markup=keyboard)
                 except Exception:
                     pass
@@ -1704,7 +1742,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ── /stats ───────────────────────────────────────────────
 async def cmd_diagnose(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """v1.7.0 — top-blocker analysis."""
+    """v1.7.0: top-blocker analysis."""
     user_id = update.effective_user.id
     running = _get_running(user_id)
     if not running:
@@ -1727,7 +1765,7 @@ async def cmd_diagnose(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 ("User-configured delay",  delay_ms)]
     if all(v <= 0 for _, v in blockers):
         await update.message.reply_text(
-            f"*💡 Diagnose (slot #{slot})*\n\n_Not enough timing data yet — let a session run 20+ bets._",
+            f"*💡 Diagnose (slot #{slot})*\n\n_Not enough timing data yet: let a session run 20+ bets._",
             parse_mode="Markdown"); return
     top_name, top_val = max(blockers, key=lambda x: x[1])
 
@@ -1772,25 +1810,25 @@ def _analytics_bounds(args: list):
 
 
 async def cmd_analytics(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """v1.8.0 — lifetime or date-windowed analytics. v1.9.0 — shared window."""
+    """v1.8.0: lifetime or date-windowed analytics. v1.9.0: shared window."""
     user_id = update.effective_user.id
     db_path = user_db_path(user_id)
     if not os.path.exists(db_path):
         await update.message.reply_text("No session history yet."); return
 
-    usage = ("Usage: `/analytics [SINCE] [UNTIL]` — e.g. `/analytics 2026-08-14`, "
+    usage = ("Usage: `/analytics [SINCE] [UNTIL]`: e.g. `/analytics 2026-08-14`, "
              "`/analytics 2026-08-01 2026-08-15` or `/analytics 2026-11-13 14:00`")
     bounds = _analytics_bounds(list(context.args or []))
     if bounds is None:
         await update.message.reply_text(usage, parse_mode="Markdown"); return
     since, until = bounds
     try:
-        # v1.9.0 — shared window (WolfBet v2.33.0): "DATE HH:MM" no longer
+        # v1.9.0: shared window (WolfBet v2.33.0): "DATE HH:MM" no longer
         # matches the whole day; a bare UNTIL date stays inclusive.
         where, wparams, _ = stats_date_window(since, until)
     except ValueError:
         await update.message.reply_text(usage, parse_mode="Markdown"); return
-    window_label = f"  ({since or '…'} → {until or '…'})" if (since or until) else ""
+    window_label = f"  ({since or '...'} → {until or '...'})" if (since or until) else ""
 
     init_db(db_path)
     conn = sqlite3.connect(db_path)
@@ -1846,13 +1884,13 @@ async def cmd_analytics(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if by_game:
         lines += ["", "*🎲 By game*"]
         for g, n, b, w, l, p, wag in by_game:
-            gr = f"{w/b*100:.1f}%" if b > 0 else "—"
+            gr = f"{w/b*100:.1f}%" if b > 0 else "-"
             sp = "+" if p >= 0 else ""
             lines.append(f"`{g}`  ·  {n} sess  ·  {b} bets  ·  {gr}  ·  `{sp}{p:.8f}`")
     if by_strat:
         lines += ["", "*🎯 By strategy*"]
         for s, n, b, w, l, p, wag in by_strat:
-            gr = f"{w/b*100:.1f}%" if b > 0 else "—"
+            gr = f"{w/b*100:.1f}%" if b > 0 else "-"
             sp = "+" if p >= 0 else ""
             lines.append(f"`{s}`  ·  {n} sess  ·  {b} bets  ·  {gr}  ·  `{sp}{p:.8f}`")
     if top_best:

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Shuffle Telegram Bot — entry point and Application wiring."""
+"""Shuffle Telegram Bot: entry point and Application wiring."""
 
 import asyncio
 import atexit
@@ -68,6 +68,9 @@ def main():
     atexit.register(_save_once)
     logger.info("Shuffle Telegram Bot v%s starting...", VERSION)
     logger.info("Data dir: %s", DATA_DIR)
+    owner = os.environ.get("TG_OWNER_ID", "").strip()
+    if not owner.isdigit():
+        logger.warning("TG_OWNER_ID is unset or not numeric: /update is disabled for everyone")
 
     async def post_init(application):
         await application.bot.set_my_commands([
@@ -158,7 +161,7 @@ def main():
     async def _error_handler(update, context: ContextTypes.DEFAULT_TYPE):
         err = context.error
         if isinstance(err, RetryAfter):
-            logger.warning("Telegram flood control — retry in %ss", err.retry_after)
+            logger.warning("Telegram flood control: retry in %ss", err.retry_after)
         elif isinstance(err, (NetworkError, TimedOut)):
             logger.warning("Telegram network: %s", err)
         else:

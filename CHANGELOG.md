@@ -1,5 +1,27 @@
 # Changelog
 
+## Security hotfixes: web, Telegram and limits (2026-11-15)
+
+### Web admin
+- `SHUFFLE_WEB_SECRET_KEY` and `SHUFFLE_WEB_ADMIN_PASS` must be non-default (32+ bytes, 12+ chars); the app exits before binding.
+- The installer generates the secret, prompts for or generates the password, writes `.env` with `printf` at 0600, refuses a weak existing `.env`, and always binds uvicorn to `127.0.0.1`.
+- Login lockout and single-use Telegram links are wired through the shared auth router.
+- Every `/api/users/{user_id}/...` route uses `require_user_access`.
+- `web/bot_db.py` exports the bound `_connect_ro(user_id)`, so the live session socket resolves.
+- The admin user page renders this service's secret keys as `hidden`.
+
+### Telegram
+- `/update` answers only to `TG_OWNER_ID`, with no fallback id and a startup warning when it is missing; the launcher is an argv list for `systemd-run` with validated paths and a 0600 log under the data dir.
+- `/set` and `/tweak` reject `nan` and `inf` for every numeric parameter, and the CLI config-set path uses the same check.
+
+### Updates
+- `shufflectl update` installs the pinned requirements and stops when the install fails.
+
+### GraphQL retry
+- `_gql_post` retries only reads. `api_place_bet` and the TG client pass `idempotent=False`, so a connection reset after the server accepted a bet raises instead of sending a second one.
+
+**Version**: see the module constants; `casino-shared` pinned to the dashboard branch.
+
 ## TG v1.10.0 - Run-wide profit increment (2026-11-15)
 
 Follows WolfBet TG v1.21.0, which added `profit_increment_scope` (`piscope`) to Telegram after the CLI release. Uses `shared.core.run_increment` from casino-shared 0.3.0. GraphQL documents, string amounts and `windowId` unchanged.
@@ -69,7 +91,7 @@ Mirrors WolfBet CLI v2.17.0 (API / cycle / efficiency metrics), v2.18.0 (wizard 
 - **Async bet writer** — `db_write_mode` `async` (default) or `sync`. The writer thread batches up to 32 rows or 0.1 s into one commit. When the 1000-row queue is full, the row is written synchronously, so no row is lost. The queue is drained before the session save on SIGTERM, daemon exit and TUI exit. A mode change takes effect on the next start.
 - **Live editing** — `T` hotkey opens the runtime tweak prompt (`param value`, WolfBet aliases plus `multiplier` / `mult` → `multiplier_target`; on dice the target is re-derived). `--config-show` (token and proxy credentials masked), `--config-set KEY=VALUE…` (refuses `bearer_token`, prints `old → new` and clamp warnings, lists restart-only keys, sends SIGHUP to a running daemon), `--version`, and a help epilog with examples. Wizard Step 5b (optional): recurring, delays, streak reset, `basebet_pct`, streak tuples, milestones. The confirm step shows `_check_risky_config` heads-ups, with WolfBet keys remapped to shuffle's: Martingale-style = `2` / `6`, rules = `7`. `proxy`, `purge_days` and `db_write_mode` are in the config, preset, live-reload and tweak key lists.
 - **Monitor** — a second footer line points at `--config-set` and `shufflectl stats / analytics`. `S` runs `systemctl --user stop shuffle` when the daemon runs in the `shuffle.service` cgroup, so `Restart=` can't respawn it; otherwise it sends SIGTERM.
-- N/A: the rate-limit row and its advice (no quota headers), `/auto/start` quota, pipeline depth, auto-bet UUID clearing and `_derive_bet_value` (no server-side auto-bet; a `base_bet` change applies to the next bet). `--benchmark --lanes` and lane shares are E5-S7. The `shufflectl` pass-throughs for these commands are E7.
+- N/A: the rate-limit row and its advice (no quota headers), `/auto/start` quota, pipeline depth, auto-bet UUID clearing and `_derive_bet_value` (no server-side auto-bet; a `base_bet` change applies to the next bet). `--benchmark --lanes` and lane shares are. The `shufflectl` pass-throughs for these commands are E7.
 - Tests: `tests/test_wolfbet_sync_e5.py` (74); `test_portability_v1.py` version pin.
 
 `VERSION` `1.8.0` → `1.9.0`.
@@ -81,7 +103,7 @@ Mirrors WolfBet CLI v2.23.0 (`--analytics`), v2.30.9 (`--stats --since/--until`)
 - **Window fix** — `--since` / `--until` use `shared.core.stats.stats_date_window`: `--since "2026-11-13 14:00"` now starts at 14:00 instead of matching the whole day (`' ' < 'T'`), a bare `--until` date runs to `23:59:59.999999`, and a bad bound prints `Invalid --since/--until "…"` and no rows. The local `_stats_date_window` is gone.
 - **`--stats` totals** — `Sessions: N  (first → last)`, `Time Span … Bet Time …` (span includes the gaps between cycles, bet time does not; `fmt_duration` format `1mo 2d 3h 4m 5s`), `Wins/Session: Max N Avg N.N`, `Losses/Session: Max N Avg N.N`. All honour the window and lane.
 - **New `--analytics [--since --until --lane K]`** — Overall panel (sessions, time range, time span, bet time, sessions in profit / loss, bets, win rate, wagered, P/L, best / worst session), By game (game labels), By strategy, By lane (only when the window has 2+ lanes), Top 5 best / worst sessions. Reads only `sessions`.
-- **Lanes** — new `--lane K` (1-10) filters `--stats` / `--analytics` on `sessions.lane` (old rows count as lane 1); session headers show `[LK]` for lane 2+. `init_db` adds `sessions.lane` idempotently (`ensure_sessions_lane`), also when `--stats` / `--analytics` open an older DB. Running lanes is not here yet (E5-S7): every new row is lane 1.
+- **Lanes** — new `--lane K` (1-10) filters `--stats` / `--analytics` on `sessions.lane` (old rows count as lane 1); session headers show `[LK]` for lane 2+. `init_db` adds `sessions.lane` idempotently (`ensure_sessions_lane`), also when `--stats` / `--analytics` open an older DB. Running lanes is not here yet: every new row is lane 1.
 - **Run time** — the dashboard header shows `Run …` (time since the first cycle started, never reset across cycles); `--monitor` shows it from `run_uptime_sec` and omits it for older state files; `--status` gains a `Running for` row.
 - **`shufflectl analytics`** pass-through (args forwarded, like `stats`).
 - N/A: none; every item maps to shuffle's `sessions` table, which has the same columns as WolfBet's.
