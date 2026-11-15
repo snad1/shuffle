@@ -42,7 +42,8 @@ def sleeps():
 
 @pytest.fixture(autouse=True)
 def _sandbox(tmp_path, monkeypatch, sleeps):
-    for name in ("DB_PATH", "CONFIG_PATH", "STATE_PATH", "PID_PATH", "PRESET_PATH"):
+    for name in ("DB_PATH", "CONFIG_PATH", "STATE_PATH", "PID_PATH", "PRESET_PATH",
+                 "RUN_PATH"):
         monkeypatch.setattr(sh, name, str(tmp_path / f"cli_{name.lower()}"))
     # v1.10.0 lanes: lane paths derive from the lane-1 paths; `_apply_lane`
     # swaps the log formatter, restored after each test.

@@ -1,5 +1,34 @@
 # Changelog
 
+## TG v1.10.0 - Run-wide profit increment (2026-11-15)
+
+Follows WolfBet TG v1.21.0, which added `profit_increment_scope` (`piscope`) to Telegram after the CLI release. Uses `shared.core.run_increment` from casino-shared 0.3.0. GraphQL documents, string amounts and `windowId` unchanged.
+
+- **Scope** - `profit_increment_scope` = `session` (default, unchanged) or `run`: profit = the user's sessions since the run started plus the current one, so a large threshold is reached across many cycles. Set with `/set piscope session|run` or `/tweak piscope`; a bad value replies "piscope must be `session` or `run`." A `/tweak` change applies to the next session.
+- **One run per user** - `run.json` in the user's data dir, shared by every slot. Bumps are written under a per-user lock that keeps the highest count any slot wrote, so two slots cannot drop each other's bump; `_run_sync` after each periodic save adopts the other slots' profit and bumps.
+- **Lifecycle** - a run starts at the first session; `_run_base_origin` (the base before any bump) travels through recurring restarts and resume snapshots, so the bumps are applied exactly once, as `origin + bumps x increment`. A run file pointing past the bot's last session (stats reset) starts a new run. Turning `pi` / `pt` to `none` / `off` / `0` ends the run; turning it back on starts a fresh one.
+- **Display** - `/status` shows `Profit bump ... run profit` and a `Run profit` line (since #N, k bump(s)).
+- **Reset** - `/runreset` refuses while a session or a scheduled restart is active, then asks for a confirmation button; the next `/bet` starts a new run from the configured base bet.
+- N/A: the auto-bet UUID restart on a bump (no server-side auto-bet).
+- Tests: `tests/test_wolfbet_sync_e10.py` TG half. `test_portability_v1.py` pins 1.10.0.
+
+`tg/VERSION` `1.9.0` → `1.10.0`.
+
+## CLI v1.12.0 - Run-wide profit increment (2026-11-15)
+
+Mirrors WolfBet CLI v2.37.0 (`profit_increment_scope`, `0b7e71a`). Uses `shared.core.run_increment` from casino-shared 0.3.0. TG changed in the same release (its own entry). GraphQL documents, string amounts and `windowId` unchanged.
+
+- **Scope** - `profit_increment_scope` (alias `piscope`) = `session` (default, unchanged) or `run`. Wizard asks after the increment prompts; `--config-set piscope=...` validates and needs a restart; `--config-show` shows it.
+- **Merged check** - one `_check_profit_increment()` replaces the inline bump block. Scope `session` behaves exactly as before, including the per-cycle milestone reset.
+- **Run file** - `~/.shuffle_run.json` (`SHUFFLE_RUN_PATH`), per lane as `.laneK.json`: `{first_session, started_at, bumps}`. On start the bumps are restored on top of the loaded base bet, the finished sessions' profit comes from the `sessions` table of that lane, and the next milestone is `(bumps + 1) x threshold`. A file past the bot's last session (stats reset) starts a new run. A recurring cycle keeps the milestone and adds the closed session's profit.
+- **Off** - `pi` / `pt` at `none` / `off` / `0` remove the run file at start and on SIGHUP reload; re-enabling starts a fresh run on the current session.
+- **Display** - `--status` adds a `Run Profit` row (since #N, bumps, next at X); the monitor segment reads `RunMs` in run scope.
+- **Reset** - `--run-reset [--lane K]` deletes the run file(s); the next start begins a new total. `shufflectl run-reset` is not part of this change.
+- N/A: the auto-bet UUID restart on a bump (no server-side auto-bet).
+- Tests: `tests/test_wolfbet_sync_e10.py` CLI half. `test_portability_v1.py` pins 1.12.0.
+
+`VERSION` `1.11.0` → `1.12.0`.
+
 ## CLI v1.11.0 — Lane split minimum bet (2026-11-15)
 
 Completes WolfBet CLI v2.36.0 (`lane_split`, `6174b96`) with the shuffle adapt from backlog Epic 9. The rest of v2.36.0 shipped in 1.10.0. TG unchanged. GraphQL documents, string amounts and `windowId` unchanged.

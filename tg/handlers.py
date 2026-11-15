@@ -181,6 +181,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "`milestoneprofit` \u2014 Notify every X profit (0=off)\n"
         "`profitthreshold` \u2014 Auto-raise base bet every X profit (`off` to disable)\n"
         "`profitincrement` \u2014 Amount to add to base bet (`off` to disable)\n"
+        "`piscope` \u2014 `session` (each session's profit) or `run` (your total since the run started)\n"
         "`proxy` \u2014 http://user:pass@ip:port or socks5://... (`off` to disable)\n"
         "`recurring` \u2014 Auto-restart on stop condition (`on`/`off`)\n"
         "`recurringdelay` \u2014 Seconds before restart (default 60, 5-86400)\n"
@@ -206,7 +207,8 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/lastbets \u2014 Recent bets\n"
         "/diagnose \u2014 Bottleneck analysis (top blocker + advice)\n"
         "/analytics \u2014 Lifetime analytics (per-game, per-strategy, top-5)\n"
-        "/analytics [SINCE] [UNTIL] \u2014 date-windowed (e.g. 2026-08-14)\n\n"
+        "/analytics [SINCE] [UNTIL] \u2014 date-windowed (e.g. 2026-08-14)\n"
+        "/runreset \u2014 Start a new run total for `piscope run` (stop sessions first)\n\n"
         "*Rules*\n"
         "/rules \u2014 List current rules\n"
         "/addrule \u2014 Add rule (JSON)\n"
@@ -473,7 +475,9 @@ async def cmd_config(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pi = config.get("profit_increment")
         pt = config.get("profit_threshold")
         if pi and pt:
-            lines.append(f"Profit increment: `+{float(pi):.8f} every {float(pt):.8f} profit`")
+            scope = config.get("profit_increment_scope") or "session"
+            lines.append(f"Profit increment: `+{float(pi):.8f} every {float(pt):.8f} profit` "
+                         f"({scope})")
 
         ms = []
         mb = config.get("milestone_bets", 100)
@@ -675,6 +679,13 @@ async def cmd_set(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 config["profit_increment"] = val
             else:
                 config["profit_increment"] = None
+        elif param in ("piscope", "pscope", "profitincrementscope"):
+            v = value.lower()
+            if v not in ("session", "run"):
+                await update.message.reply_text("piscope must be `session` or `run`.",
+                                                parse_mode="Markdown")
+                return
+            config["profit_increment_scope"] = v
         elif param == "recurring":
             if value.lower() in ("on", "true", "yes", "1"):
                 config["recurring"] = True
@@ -991,9 +1002,13 @@ async def _notify_stop(chat_id: int, user_id: int, slot: int, reason: str, app):
 
     if rec and recurring_on and reason != "Stopped by user" and "insufficient" not in reason.lower():
         config = rec["config"]
+        # Base before the run bumps, so they never stack twice on the restart.
+        config["_run_base_origin"] = getattr(engine, "_run_base_origin", None)
         if live_config is not None:
             # Carry live /set changes to the streak-reset settings into the next cycle.
             for k in ("streak_reset_losses", "streak_reset_delay"):
+                config[k] = live_config.get(k)
+            for k in ("profit_increment", "profit_threshold", "profit_increment_scope"):
                 config[k] = live_config.get(k)
         # Carry forward the current base_bet (profit increment may have raised it)
         config["base_bet"] = engine.base_bet
@@ -1308,6 +1323,13 @@ async def cmd_tweak(update: Update, context: ContextTypes.DEFAULT_TYPE):
             changes["profit_increment"] = None if off else float(value)
         elif param in ("profitthreshold", "pt"):
             changes["profit_threshold"] = None if off else float(value)
+        elif param in ("piscope", "pscope", "profitincrementscope"):
+            v = value.lower()
+            if v not in ("session", "run"):
+                await update.message.reply_text("piscope must be `session` or `run`.",
+                                                parse_mode="Markdown")
+                return
+            changes["profit_increment_scope"] = v
         else:
             await update.message.reply_text(f"Unknown tweak param: `{param}`\nUse `/tweak` for options.", parse_mode="Markdown")
             return
@@ -1556,6 +1578,18 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             s, e = next(iter(running.items()))
             return s, e
         return None, None
+
+    if query.data == "runreset_confirm":
+        if _get_running(user_id) or recurring_state.get(user_id):
+            await _reply(update,
+                "Stop your sessions first (`/stop recurring`), then /runreset.")
+            return
+        if _delete_run_file(user_id):
+            await _reply(update, "Run total reset. The next /bet starts a new run "
+                                 "(base bet from /config).")
+        else:
+            await _reply(update, "No run total to reset.")
+        return
 
     if action == "refresh_status":
         s, engine = _get_engine()
@@ -2351,6 +2385,32 @@ async def cmd_delsession(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Deleted session *#{session_id}* ({row[1]:,} bets, profit: {row[2]:.8f}).",
         parse_mode="Markdown",
     )
+
+
+# ── /runreset ────────────────────────────────────────────
+async def cmd_runreset(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Start a new run total for profit_increment_scope=run."""
+    user_id = update.effective_user.id
+    if _get_running(user_id) or recurring_state.get(user_id):
+        await _reply(update, "Stop your sessions first (`/stop recurring`), then /runreset "
+                             " - running sessions hold the run's raised base bet.",
+                     parse_mode="Markdown")
+        return
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("Reset run", callback_data="runreset_confirm"),
+        InlineKeyboardButton("Cancel", callback_data="noop"),
+    ]])
+    await _reply(update, "Delete the run total? The next /bet starts a new run "
+                         "(base bet from /config).", reply_markup=keyboard)
+
+
+def _delete_run_file(user_id: int) -> bool:
+    """Remove the user's run total. True when one existed."""
+    try:
+        os.remove(os.path.join(os.path.dirname(user_db_path(user_id)), "run.json"))
+        return True
+    except OSError:
+        return False
 
 
 async def load_resume_state(application):

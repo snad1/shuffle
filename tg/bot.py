@@ -21,7 +21,7 @@ from .handlers import (
     cmd_rules, cmd_addrule, cmd_delrule, cmd_editrule, cmd_clearrules,
     cmd_presets, cmd_savepreset, cmd_loadpreset,
     cmd_session, cmd_web,
-    cmd_cleanup, cmd_delsession,
+    cmd_cleanup, cmd_delsession, cmd_runreset,
     callback_handler,
     save_resume_state, load_resume_state,
 )
@@ -150,6 +150,7 @@ def main():
     app.add_handler(CommandHandler("benchmark", cmd_benchmark))
     app.add_handler(CommandHandler("cleanup", cmd_cleanup))
     app.add_handler(CommandHandler("delsession", cmd_delsession))
+    app.add_handler(CommandHandler("runreset", cmd_runreset))
 
     # Inline button callbacks
     app.add_handler(CallbackQueryHandler(callback_handler))
