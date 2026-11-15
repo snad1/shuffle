@@ -13,13 +13,15 @@ Key features:
 
 import asyncio
 import json
+import os
 import time
 import random
 import string
 import sqlite3
+import threading
 from datetime import datetime
 from collections import deque
-from typing import Optional, List
+from typing import Dict, List, Optional
 
 from .config import API_URL, APP_ENV, MIN_BET, logger
 from core.database import init_db, db_connect, cleanup_old_bets, cleanup_live_bets
@@ -28,6 +30,22 @@ from core.engine import compute_next_bet, apply_action, evaluate_rules
 from shared.core.session_rules import (
     STREAK_RESET_REASON, record_outcome, streak_reset_triggered, streak_reset_stop_reason,
 )
+from shared.core.run_increment import (
+    check_profit_increment, db_max_session_id, increment_on, load_run, next_milestone,
+    parse_scope, run_is_stale, run_profit_done, save_run,
+)
+
+# One run file per user, shared by every slot that user runs. The lock guards
+# the read-modify-write of the bump counter so two slots cannot drop each
+# other's bump. All engines live in one process, so a thread lock is enough.
+_RUN_LOCKS: Dict[int, threading.Lock] = {}
+
+
+def _run_lock(user_id: int) -> threading.Lock:
+    lock = _RUN_LOCKS.get(user_id)
+    if lock is None:
+        lock = _RUN_LOCKS[user_id] = threading.Lock()
+    return lock
 
 # Try curl_cffi async for TLS fingerprint bypass; fall back to httpx
 try:
@@ -367,6 +385,18 @@ class BettingEngine:
         self.profit_threshold     = config.get("profit_threshold")
         self.next_profit_milestone = float(self.profit_threshold) if self.profit_threshold else 0.0
 
+        # ── run-wide increment ──
+        # scope "run": the user's total across every session (all slots) since
+        # the run started; bumps are shared through <user dir>/run.json.
+        self.profit_increment_scope = self._parse_scope(config.get("profit_increment_scope"))
+        _origin = config.get("_run_base_origin")
+        self._run_base_origin: Optional[float] = float(_origin) if _origin is not None else None
+        self.run_first_session: Optional[int] = None
+        self.run_bumps = 0
+        self.run_since: Optional[str] = None
+        self._run_others = 0.0     # DB profit of the run's other sessions (cached)
+        self._run_bump_pending = False   # another slot's bump applied by _run_sync
+
         # ── milestone config ──
         self.milestone_bets   = _cfg(config, "milestone_bets", 100, int)
         self.milestone_wins   = _cfg(config, "milestone_wins", 0, int)
@@ -687,6 +717,216 @@ class BettingEngine:
         conn.close()
         return sid
 
+    # ── RUN-WIDE PROFIT INCREMENT ─────────────────────────
+    # Scope "run": the user's total across every session (all slots) since the
+    # run started; bumps are shared through <user dir>/run.json so they survive
+    # stops, restarts and recurring cycles.
+    @staticmethod
+    def _parse_scope(value) -> str:
+        """'Run ' -> 'run'; anything but session / run falls back to session."""
+        try:
+            return parse_scope(value)
+        except ValueError:
+            return "session"
+
+    def _increment_on(self) -> bool:
+        return increment_on(self.profit_increment, self.profit_threshold)
+
+    def _run_path(self) -> str:
+        return os.path.join(os.path.dirname(self.db_path) or ".", "run.json")
+
+    def _save_run(self) -> None:
+        """Persist the run, keeping the highest bump count any slot wrote."""
+        if self.run_first_session is None:
+            return
+        with _run_lock(self.user_id):
+            saved = load_run(self._run_path()) or {}
+            self.run_bumps = max(self.run_bumps, int(saved.get("bumps") or 0))
+            try:
+                save_run(self._run_path(), {"first_session": self.run_first_session,
+                                            "started_at": self.run_since,
+                                            "bumps": self.run_bumps})
+            except OSError as e:
+                logger.warning("User %d: run file save failed: %s", self.user_id, e)
+
+    def _end_run(self, reason: str) -> None:
+        had = self.run_first_session is not None
+        try:
+            os.remove(self._run_path())
+            had = True
+        except OSError:
+            pass
+        self.run_first_session = None
+        self.run_since = None
+        self.run_bumps = 0
+        self._run_others = 0.0
+        if had:
+            logger.info("User %d: RUN ended (%s) - the next run starts fresh",
+                        self.user_id, reason)
+
+    def _run_db_sum(self, first_sid: int) -> float:
+        """Profit of the run's sessions (all slots) except this engine's own."""
+        try:
+            conn = db_connect(self.db_path)
+        except sqlite3.Error as e:
+            logger.warning("User %d: run profit query failed: %s", self.user_id, e)
+            return 0.0
+        try:
+            return run_profit_done(conn, first_sid, exclude_sid=self.session_id or -1)
+        finally:
+            conn.close()
+
+    def _db_max_session_id(self) -> int:
+        try:
+            conn = db_connect(self.db_path)
+        except sqlite3.Error:
+            return 0
+        try:
+            return db_max_session_id(conn)
+        finally:
+            conn.close()
+
+    def run_profit_total(self) -> float:
+        return self._run_others + self.profit
+
+    def _apply_run_bumps(self) -> None:
+        """base_bet = origin + bumps x increment (basebet_pct keeps its own path)."""
+        if self.basebet_pct > 0 or self._run_base_origin is None or not self.profit_increment:
+            return
+        self.base_bet = round(
+            self._run_base_origin + self.run_bumps * float(self.profit_increment), 8)
+        self.current_bet = max(self.current_bet, self.base_bet) if self.total_bets else self.base_bet
+
+    def _init_run(self, resumed: bool = False) -> None:
+        """Join (or prepare) the user's run before betting. Scope "run" only.
+
+        Off (none / 0) or per-session scope removes a leftover run file so old
+        bumps never come back. A file pointing past the DB's last session (the
+        stats were reset) starts a new run.
+        """
+        self.run_first_session = None
+        self.run_since = None
+        self.run_bumps = 0
+        self._run_others = 0.0
+        if self.profit_increment_scope != "run" or not self._increment_on():
+            self._end_run("increment off" if self.profit_increment_scope == "run"
+                          else "scope session")
+            return
+        if self._run_base_origin is None:
+            # Fresh /bet: the config base is the origin. Resume: the snapshot
+            # base already holds the bumps, so they are subtracted back out.
+            self._run_base_origin = self.base_bet
+            pending_resume_fix = resumed
+        else:
+            pending_resume_fix = False
+        run = load_run(self._run_path())
+        if run and run_is_stale(run, self._db_max_session_id()):
+            logger.warning("User %d: RUN file points past the stats DB - starting a new run",
+                           self.user_id)
+            run = None
+        if run:
+            self.run_first_session = run["first_session"]
+            self.run_since = run["started_at"]
+            self.run_bumps = run["bumps"]
+            self._run_others = self._run_db_sum(run["first_session"])
+            if pending_resume_fix and self.profit_increment:
+                self._run_base_origin = round(
+                    self.base_bet - self.run_bumps * float(self.profit_increment), 8)
+            self._apply_run_bumps()
+        if self.profit_threshold:
+            self.next_profit_milestone = next_milestone(self.run_bumps,
+                                                        float(self.profit_threshold))
+        logger.info("User %d: RUN %s since #%s bumps=%d run profit=%+.8f base_bet=%.8f",
+                    self.user_id, "joined" if run else "new",
+                    self.run_first_session or "next", self.run_bumps,
+                    self._run_others, self.base_bet)
+
+    def _attach_run(self, session_id: int) -> None:
+        if (self.profit_increment_scope == "run" and self._increment_on()
+                and self.run_first_session is None and session_id):
+            run = load_run(self._run_path())     # another slot may have started one
+            if run:
+                self.run_first_session = run["first_session"]
+                self.run_since = run["started_at"]
+                self.run_bumps = run["bumps"]
+                self._apply_run_bumps()
+                return
+            self.run_first_session = session_id
+            self.run_since = datetime.now().isoformat()
+            self.run_bumps = 0
+            self._save_run()
+
+    def _run_sync(self) -> bool:
+        """Refresh the other slots' profit and shared bumps; True if base_bet changed."""
+        if self.run_first_session is None:
+            return False
+        run = load_run(self._run_path())
+        if not run or run["first_session"] != self.run_first_session:
+            # /runreset or another slot ended the run.
+            self.run_first_session = None
+            self.run_since = None
+            self.run_bumps = 0
+            self._run_others = 0.0
+            return False
+        self._run_others = self._run_db_sum(self.run_first_session)
+        if run["bumps"] != self.run_bumps:
+            self.run_bumps = run["bumps"]
+            if self.profit_threshold:
+                self.next_profit_milestone = next_milestone(
+                    self.run_bumps, float(self.profit_threshold))
+            before = self.base_bet
+            self._apply_run_bumps()
+            if self.base_bet != before:
+                self._run_bump_pending = True
+                return True
+        return False
+
+    def _maybe_profit_increment(self) -> bool:
+        """Bump base_bet at the next milestone. True when base_bet changed.
+
+        Scope "session": this session's profit. Scope "run": the user's run
+        total; the bump is shared through run.json, so every slot follows.
+        """
+        if self._run_bump_pending:
+            self._run_bump_pending = False      # a bump made by another slot
+            return True
+        if not self._increment_on():
+            return False
+        run = self.profit_increment_scope == "run" and self.run_first_session is not None
+        if run:
+            cur = load_run(self._run_path())
+            if (cur and cur["first_session"] == self.run_first_session
+                    and cur["bumps"] > self.run_bumps):
+                self.run_bumps = cur["bumps"]
+                if self.profit_threshold:
+                    self.next_profit_milestone = next_milestone(
+                        self.run_bumps, float(self.profit_threshold))
+            profit = self.run_profit_total()
+        else:
+            profit = self.profit
+        bumped, base, next_ms, bumps = check_profit_increment(
+            profit, self.next_profit_milestone, self.profit_threshold,
+            self.profit_increment, self.base_bet, self.run_bumps if run else 0)
+        if not bumped:
+            return False
+        if self.basebet_pct > 0 and self.current_balance > 0:
+            self.base_bet = round(self.current_balance * self.basebet_pct, 8)
+            if run:
+                self.run_bumps = bumps
+        elif run:
+            self.run_bumps = bumps
+            self._apply_run_bumps()
+        else:
+            self.base_bet = base
+        self.next_profit_milestone = next_ms
+        if run:
+            self._save_run()
+        logger.info("User %d: %sPROFIT INCREMENT base_bet -> %.8f (next at %.8f profit)",
+                    self.user_id, "RUN " if run else "", self.base_bet,
+                    self.next_profit_milestone)
+        return True
+
+
     def _queue_bet(self, result: dict, profit: float, balance: float):
         """Queue a bet row for batched insertion.
 
@@ -790,6 +1030,9 @@ class BettingEngine:
                 await asyncio.to_thread(self._flush_bets)
             else:
                 await asyncio.to_thread(self._db_save_session)
+            # Refresh the run total (other slots) after each save.
+            if self.run_first_session is not None:
+                await asyncio.to_thread(self._run_sync)
 
         # Live cleanup: purge old bets every hour to prevent DB bloat
         if now - self._last_cleanup >= 3600:
@@ -898,7 +1141,9 @@ class BettingEngine:
                         self.user_id, self.basebet_pct, self.base_bet, bal)
         self.session_start   = time.time()
         self._last_session_save = time.time()
+        self._init_run()
         self.session_id      = self._db_start_session()
+        self._attach_run(self.session_id)
         self.running         = True
         self.status          = "Starting..."
 
@@ -932,6 +1177,8 @@ class BettingEngine:
             "streak_reset_delay": self.streak_reset_delay,
             "profit_increment": self.profit_increment,
             "profit_threshold": self.profit_threshold,
+            "profit_increment_scope": self.profit_increment_scope,
+            "_run_base_origin": self._run_base_origin,
             "proxy": self.proxy,
             "milestone_bets": self.milestone_bets,
             "milestone_wins": self.milestone_wins,
@@ -998,6 +1245,7 @@ class BettingEngine:
         self.paroli_count      = snap.get("paroli_count", 0)
         self.next_profit_milestone  = snap.get("next_profit_milestone", 0.0)
         self._last_profit_milestone = snap.get("_last_profit_milestone", 0.0)
+        self._run_base_origin       = snap["config"].get("_run_base_origin")
 
     async def start_resumed(self) -> bool:
         if not self._http:
@@ -1012,6 +1260,8 @@ class BettingEngine:
         self.paused = False
         self.status = "Resumed"
         self._last_session_save = time.time()
+        self._init_run(resumed=True)
+        self._attach_run(self.session_id)
         elapsed = time.time() - self.session_start if self.session_start else 0
         if elapsed > 0 and self.total_bets > 0:
             self.bets_per_second = self.total_bets / elapsed
@@ -1090,7 +1340,27 @@ class BettingEngine:
             msgs.append(f"Profit increment: {float(self.profit_increment):.8f}" if self.profit_increment else "Profit increment: off")
         if "profit_threshold" in changes:
             self.profit_threshold = changes["profit_threshold"]
+            if self.profit_threshold:
+                done = self.run_bumps if self.profit_increment_scope == "run" else 0
+                self.next_profit_milestone = next_milestone(done, self.profit_threshold)
             msgs.append(f"Profit threshold: {float(self.profit_threshold):.8f}" if self.profit_threshold else "Profit threshold: off")
+        if "profit_increment_scope" in changes:
+            self.profit_increment_scope = parse_scope(changes["profit_increment_scope"])
+            msgs.append(f"Profit increment scope: {self.profit_increment_scope} "
+                        "(applies on the next session)")
+        # A run ends when the increment is turned off and starts fresh when it
+        # is turned back on, so a stale run never outlives the setting.
+        if (self.profit_increment_scope == "run"
+                and {"profit_increment", "profit_threshold"} & set(changes)):
+            if not self._increment_on():
+                self._end_run("increment off")
+                msgs.append("Run total ended (increment off)")
+            elif self.run_first_session is None and self.session_id:
+                self._run_base_origin = self.base_bet
+                self._attach_run(self.session_id)
+                if self.profit_threshold:
+                    self.next_profit_milestone = float(self.profit_threshold)
+                msgs.append(f"Run total started at session #{self.session_id}")
         if "base_bet" in changes:
             self.base_bet = float(changes["base_bet"])
             # Don't reset current_bet during loss streak — applies on next win
@@ -1203,6 +1473,10 @@ class BettingEngine:
             "stop_conditions": stops,
             "profit_increment": self.profit_increment,
             "profit_threshold": self.profit_threshold,
+            "profit_increment_scope": self.profit_increment_scope,
+            "run_profit_total": self.run_profit_total(),
+            "run_first_session": self.run_first_session,
+            "run_bumps": self.run_bumps,
             "next_profit_milestone": self.next_profit_milestone,
             "milestone_bets": self.milestone_bets,
             "streak_delay_loss": self.streak_delay_loss,
@@ -1418,15 +1692,7 @@ class BettingEngine:
             await self._periodic_save()
 
             # profit-based base bet increment
-            if (self.profit_increment is not None and self.profit_threshold
-                    and self.profit >= self.next_profit_milestone):
-                if self.basebet_pct > 0 and self.current_balance > 0:
-                    self.base_bet = round(self.current_balance * self.basebet_pct, 8)
-                else:
-                    self.base_bet += self.profit_increment
-                self.next_profit_milestone += self.profit_threshold
-                logger.info("User %d: PROFIT INCREMENT base_bet -> %.8f (next at %.8f profit)",
-                            self.user_id, self.base_bet, self.next_profit_milestone)
+            self._maybe_profit_increment()
 
             # rule-based strategy
             if self.strategy_key == "7" and self.custom_rules:
