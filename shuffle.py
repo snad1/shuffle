@@ -24,7 +24,7 @@ from shared.core.net import validate_proxy, mask_proxy
 from shared.core.lanes import (
     LANES_MAX, LANE_SPLIT_HELP, LANE_UNSET_VALUES, check_lane_keys, lane_budget_exceeded,
     lane_config, lane_equity, lane_path, lane_share, lane_split, lanes_count,
-    recommend_lanes, split_bet_divisor, split_budget_on, split_lane_pairs, validate_lane,
+    recommend_lanes, split_base_bet, split_budget_on, split_lane_pairs, validate_lane,
 )
 try:
     import readline
@@ -87,7 +87,7 @@ STATE_PATH   = os.path.expanduser("~/.shuffle_autobot_live.json")
 PID_PATH     = os.path.expanduser("~/.shuffle_autobot.pid")
 PRESET_PATH  = os.path.expanduser("~/.shuffle_presets.json")
 LOG_DIR      = os.path.expanduser("~/.shuffle_logs")
-VERSION      = "1.10.0"
+VERSION      = "1.11.0"
 MIN_BET      = 0.001   # Shuffle minimum bet
 APP_ENV      = os.environ.get("APP_ENV", "production")
 
@@ -488,7 +488,8 @@ def load_config() -> bool:
         # v1.10.0 — lane overrides and the lane bet split go over the base config.
         state.lanes_count = lanes_count(data)
         state.lane_split = lane_split(data)
-        merged, warn = lane_config(data, state.lane, _LANE_FORBIDDEN_KEYS)
+        # v1.11.0 (WolfBet v2.36.0) — a split bet below MIN_BET stays full.
+        merged, warn = lane_config(data, state.lane, _LANE_FORBIDDEN_KEYS, MIN_BET)
         if warn:
             logger.warning(warn)
         state.base_bet_disk = data.get("base_bet")
@@ -543,7 +544,7 @@ def _reload_live_config() -> dict:
         return {}
     # v1.10.0 — merge this lane's overrides and bet split (WolfBet v2.35.0 / v2.36.0).
     # The lane count and split mode themselves apply on the next start.
-    data, _ = lane_config(data, state.lane, _LANE_FORBIDDEN_KEYS)
+    data, _ = lane_config(data, state.lane, _LANE_FORBIDDEN_KEYS, MIN_BET)
     applied, skipped = {}, []
     tuple_keys = set(_STREAK_TUPLE_KEYS)
     with state.lock:
@@ -1835,8 +1836,12 @@ def _apply_basebet_pct() -> bool:
     if state.basebet_pct <= 0 or state.current_balance <= 0:
         return False
     # v1.10.0 — the lane bet split divides it too (WolfBet v2.36.0).
-    new_base = round(state.current_balance * state.basebet_pct
-                     / split_bet_divisor(state.lanes_count, state.lane_split), 8)
+    # v1.11.0 — a split bet that rounds to 0 or is below MIN_BET stays full.
+    new_base, note = split_base_bet(
+        round(state.current_balance * state.basebet_pct, 8),
+        state.lanes_count, state.lane_split, False, MIN_BET)
+    if note:
+        logger.warning(note)
     if new_base <= 0 or abs(new_base - state.base_bet) < 1e-12:
         return False
     with state.lock:
