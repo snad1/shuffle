@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ─────────────────────────────────────────────────────────
-#  Shuffle AutoBot — Server Installer v1.0
+#  Shuffle AutoBot - Server Installer v1.1
 #  Sets up on Linux servers with apt package manager
 #  Sets up: venv, systemd, shufflectl
 #  No Docker/FlareSolverr needed (Bearer token auth)
@@ -9,26 +9,27 @@ set -euo pipefail
 
 INSTALL_DIR="$HOME/shuffle-bot"
 SERVICE_NAME="shuffle"
+LANE_SERVICE_NAME="shuffle-lane"
 TG_SERVICE_NAME="shuffle-tg"
 SYSTEMD_DIR="$HOME/.config/systemd/user"
 SHUFFLECTL="$HOME/.local/bin/shufflectl"
 
 echo ""
 echo "╔══════════════════════════════════════════════════╗"
-echo "║   Shuffle AutoBot — Server Installer v1.0          ║"
+echo "║   Shuffle AutoBot - Server Installer v1.1          ║"
 echo "║   CLI Bot + Telegram Bot                           ║"
 echo "╚══════════════════════════════════════════════════╝"
 echo ""
 
 # ── 1. System dependencies ─────────────────────────────
-echo "[1/7] Installing system packages…"
+echo "[1/7] Installing system packages..."
 sudo apt-get update -qq
 sudo apt-get install -y -qq \
     python3 python3-pip python3-venv python3-dev \
     sqlite3 tmux curl
 
 # ── 2. Bot directory ───────────────────────────────────
-echo "[2/7] Setting up bot directory…"
+echo "[2/7] Setting up bot directory..."
 mkdir -p "$INSTALL_DIR"
 cp shuffle.py      "$INSTALL_DIR/"
 cp requirements.txt "$INSTALL_DIR/"
@@ -47,15 +48,6 @@ cp tg/formatter.py   "$INSTALL_DIR/tg/"
 cp tg/handlers.py    "$INSTALL_DIR/tg/"
 cp tg/bot.py         "$INSTALL_DIR/tg/"
 
-# Copy shared/ library (cross-bot shared modules)
-if [ -d "../shared" ]; then
-    rm -rf "$INSTALL_DIR/shared"
-    cp -r ../shared "$INSTALL_DIR/"
-    echo "   shared/ library copied"
-else
-    echo "   shared/ not copied locally (pip package used instead)"
-fi
-
 # Copy .env
 if [ -f ".env" ]; then
     cp .env "$INSTALL_DIR/.env"
@@ -66,25 +58,28 @@ elif [ -f ".env.example" ]; then
 fi
 
 # ── 3. Python virtual environment ─────────────────────
-echo "[3/7] Creating Python virtual environment…"
+echo "[3/7] Creating Python virtual environment..."
 python3 -m venv "$INSTALL_DIR/venv"
 "$INSTALL_DIR/venv/bin/pip" install --quiet --upgrade pip
 "$INSTALL_DIR/venv/bin/pip" install --quiet -r "$INSTALL_DIR/requirements.txt"
 
 # ── 4. Systemd user services ─────────────────────────
-echo "[4/7] Setting up systemd services…"
+echo "[4/7] Setting up systemd services..."
 mkdir -p "$SYSTEMD_DIR"
 
 # CLI bot service
 cat > "$SYSTEMD_DIR/${SERVICE_NAME}.service" << SERVICEEOF
 [Unit]
-Description=Shuffle AutoBot — Multi-Game Auto-Betting Engine
+Description=Shuffle AutoBot - Multi-Game Auto-Betting Engine
 After=network-online.target
 Wants=network-online.target
 StartLimitIntervalSec=0
 
 [Service]
 Type=simple
+Nice=-5
+IOSchedulingClass=best-effort
+IOSchedulingPriority=0
 WorkingDirectory=${INSTALL_DIR}
 ExecStart=${INSTALL_DIR}/venv/bin/python3 ${INSTALL_DIR}/shuffle.py --resume --daemon
 Restart=on-failure
@@ -104,10 +99,40 @@ Environment=PYTHONUNBUFFERED=1
 WantedBy=default.target
 SERVICEEOF
 
+# Parallel lanes 2..N: same unit as lane 1 plus --lane %i (shufflectl lanes N)
+cat > "$SYSTEMD_DIR/${LANE_SERVICE_NAME}@.service" << LANESERVICEEOF
+[Unit]
+Description=Shuffle AutoBot - parallel lane %i (CLI)
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+Nice=-5
+IOSchedulingClass=best-effort
+IOSchedulingPriority=0
+WorkingDirectory=${INSTALL_DIR}
+ExecStart=${INSTALL_DIR}/venv/bin/python3 ${INSTALL_DIR}/shuffle.py --resume --daemon --lane %i
+Restart=on-failure
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+KillSignal=SIGTERM
+TimeoutStopSec=15
+
+Environment=HOME=${HOME}
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=default.target
+LANESERVICEEOF
+
 # Telegram bot service
 cat > "$SYSTEMD_DIR/${TG_SERVICE_NAME}.service" << TGSERVICEEOF
 [Unit]
-Description=Shuffle Telegram Bot — Multi-Game Auto-Betting via Telegram
+Description=Shuffle Telegram Bot - Multi-Game Auto-Betting via Telegram
 After=network-online.target
 Wants=network-online.target
 StartLimitIntervalSec=0
@@ -138,7 +163,7 @@ TGSERVICEEOF
 # Watchdog: restart TG bot if heartbeat file is stale (catches stuck-but-alive)
 cat > "$SYSTEMD_DIR/${TG_SERVICE_NAME}-watchdog.service" << WDSERVICEEOF
 [Unit]
-Description=Shuffle Telegram Bot — Stall Watchdog
+Description=Shuffle Telegram Bot - Stall Watchdog
 After=${TG_SERVICE_NAME}.service
 
 [Service]
@@ -148,7 +173,7 @@ WDSERVICEEOF
 
 cat > "$SYSTEMD_DIR/${TG_SERVICE_NAME}-watchdog.timer" << WDTIMEREOF
 [Unit]
-Description=Shuffle Telegram Bot — Stall Watchdog Timer (every 2 min)
+Description=Shuffle Telegram Bot - Stall Watchdog Timer (every 2 min)
 
 [Timer]
 OnBootSec=3min
@@ -161,18 +186,19 @@ WDTIMEREOF
 
 sudo loginctl enable-linger "$(whoami)" 2>/dev/null || true
 systemctl --user daemon-reload
+# Boot-enable only (no --now): a bot stopped by hand stays stopped until the next boot.
+systemctl --user enable ${SERVICE_NAME} 2>/dev/null || true
 systemctl --user enable --now ${TG_SERVICE_NAME}-watchdog.timer 2>/dev/null || true
-echo "   Services installed: ${SERVICE_NAME}.service, ${TG_SERVICE_NAME}.service, ${TG_SERVICE_NAME}-watchdog.timer"
+echo "   Services installed: ${SERVICE_NAME}.service, ${LANE_SERVICE_NAME}@.service, ${TG_SERVICE_NAME}.service, ${TG_SERVICE_NAME}-watchdog.timer"
 
 # ── 5. Management scripts ─────────────────────────────
-echo "[5/7] Creating management commands…"
+echo "[5/7] Creating management commands..."
 mkdir -p "$HOME/.local/bin"
 
-cp shufflectl "$SHUFFLECTL"
-chmod +x "$SHUFFLECTL"
+install -m 0755 shufflectl "$SHUFFLECTL"
 
 # ── 6. TG bot env file placeholder ─────────────────────
-echo "[6/7] Checking Telegram bot config…"
+echo "[6/7] Checking Telegram bot config..."
 if [ -f "$HOME/.shuffle_tg_env" ]; then
     echo "   Telegram bot token already configured."
 else
@@ -180,7 +206,7 @@ else
 fi
 
 # ── 7. Quick-run scripts ─────────────────────────────
-echo "[7/7] Creating helper scripts…"
+echo "[7/7] Creating helper scripts..."
 
 cat > "$INSTALL_DIR/run.sh" << 'EOF'
 #!/usr/bin/env bash
@@ -227,7 +253,7 @@ echo "    shufflectl tg restart     Restart Telegram bot"
 echo "    shufflectl tg status      Check Telegram bot status"
 echo "    shufflectl tg logs        Stream Telegram bot logs"
 echo ""
-echo "  Both bots run as systemd user services — they will:"
+echo "  Both bots run as systemd user services - they will:"
 echo "    - Auto-restart on crashes (after 10s)"
 echo "    - Keep running after you log out (lingering enabled)"
 echo "    - Log to journalctl (shufflectl logs)"
