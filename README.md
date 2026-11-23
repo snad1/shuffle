@@ -1,4 +1,4 @@
-# Shuffle AutoBot v1.6.0 + Telegram Bot v1.8.0 + Web Admin v0.1
+# Shuffle AutoBot v1.13.0 + Telegram Bot v1.10.1 + Web Admin v0.1
 
 High-speed multi-game auto-betting engine for Shuffle.com (Limbo + Dice) with a live terminal dashboard, a Telegram bot, and a web admin panel. Uses GraphQL API with Bearer token auth and curl_cffi Chrome TLS fingerprinting for server deployments.
 
@@ -110,6 +110,22 @@ python3 shuffle.py --stats           # Show all session history + totals + uptim
                                      #   add --since DATE / --until DATE for a date window
 python3 shuffle.py --last-bets N     # Show last N bets across sessions
 python3 shuffle.py --session-bets N  # Full stats + streak distribution for session N
+python3 shuffle.py --version            # Print the version
+python3 shuffle.py --analytics          # Aggregates: by game, strategy, lane, top 5 best / worst (--since / --until / --lane K)
+python3 shuffle.py --config-show        # Print the saved config (secrets masked)
+python3 shuffle.py --config-set maxloss=5 delay=0  # Edit saved config; a running daemon reloads live keys (SIGHUP)
+python3 shuffle.py --config-set piscope=run pi=0.0001 pt=0.001  # Run-wide profit increment (piscope=session keeps it per session)
+python3 shuffle.py --benchmark 20       # Time N read-only probe requests (no bets)
+python3 shuffle.py --benchmark 20 --lanes 4  # Also probe 1..M concurrent clients and recommend a lane count
+python3 shuffle.py --diagnose           # Bottleneck analysis of the running daemon
+python3 shuffle.py --cleanup [DAYS]     # Purge bet rows of sessions ended > DAYS ago (default purge_days)
+python3 shuffle.py --config-set lanes=2 lane_split=budget  # Parallel lanes: count + money split (none / budget / bet / both)
+python3 shuffle.py --daemon --lane 2    # Run lane 2 (--status / --monitor / --stop / --stats --lane K act on lane K)
+python3 shuffle.py --run-reset [--lane K]  # New run total for the run-wide profit increment
+python3 shuffle.py --export ~/s12.csv --export-session-id 12  # Export a session (.json = JSON, else CSV; default latest)
+python3 shuffle.py --backtest --simulate 10000 --seed 42  # Offline backtest: no API calls, no real balance
+python3 shuffle.py --backtest --replay-session 12  # Replay a stored session's outcomes offline
+python3 shuffle.py --verbose            # Debug logging (dev mode)
 ```
 
 ---
@@ -133,6 +149,24 @@ shufflectl stats          # View all-time statistics (--since/--until for a wind
 shufflectl session ID     # Full stats + streak distribution
 shufflectl presets        # List saved presets
 shufflectl update         # Update bot from current directory
+shufflectl lanes [N] [--split none|budget|bet|both]  # Show or set parallel lanes (1-10)
+shufflectl diagnose         # Bottleneck analysis of the running session
+shufflectl benchmark [N] [--lanes M]  # Time N probe requests
+shufflectl doctor [--fix] [--yes]  # Health check; --fix applies safe fixes
+shufflectl start-all        # Start CLI Bot + Telegram Bot + Web Admin
+shufflectl stop-all         # Stop  CLI Bot + Telegram Bot + Web Admin
+shufflectl status-all       # Show status of all three services
+shufflectl config-set KEY=VALUE ...  # Change saved keys; a running daemon reloads
+shufflectl analytics [--since DATE] [--until DATE] [--lane K]  # Aggregates: by game, strategy, lane, top 5
+shufflectl last-bets [N]    # Last N bets across all sessions (default 20)
+shufflectl export PATH [SID]  # Export a session (CSV, or JSON by .json extension)
+shufflectl backtest [args]  # Backtest / replay offline (no API calls, no real balance)
+shufflectl cleanup [DAYS]   # Purge bet rows of old sessions (default: purge_days)
+shufflectl reset [--yes]    # Archive the stats DB and start fresh (never deletes)
+shufflectl archives         # List archived stats DBs
+shufflectl run-reset [--yes]  # New run total for the run-wide profit increment
+shufflectl refresh          # Reinstall shufflectl from the repo copy in this folder
+shufflectl version          # Bot and shufflectl versions
 
 # Telegram bot
 shufflectl tg setup       # Enter your bot token
@@ -179,6 +213,13 @@ The Telegram bot (`shuffle/tg/`) provides the same engine via Telegram commands.
 | `/presets` / `/savepreset` / `/loadpreset` | Manage presets |
 | `/cleanup [days]` | Purge old bet records |
 | `/delsession <id>` | Delete a specific session |
+| `/start` | Welcome and quick start guide |
+| `/update` | Pull the latest code and restart the bot (owner only) |
+| `/tweak <param> <value>` | Change a setting of a running session (e.g. `/tweak delay 0.1`) |
+| `/diagnose` | Bottleneck analysis of a running session |
+| `/web` | Open web dashboard |
+| `/benchmark` | Test API response speed |
+| `/runreset` | Start a new run total for `piscope run` (asks to confirm; stop sessions first) |
 
 ---
 
