@@ -247,6 +247,114 @@ def test_live_reload_increment_on_starts_run():
     assert json.load(open(sh.RUN_PATH))["first_session"] == 8
 
 
+
+# ── the base the operator sets is the base it bets ────────
+def _bumped_daemon(bumps=5, profit=0.007):
+    """A run-scope daemon on base 0.001 whose live base carries `bumps` bumps."""
+    _cfg("run", thr=0.003)
+    s = sh.state
+    s.base_bet_disk, s.base_bet_split, s.run_base_origin = 0.001, None, None
+    s.session_id = 5
+    _write_cfg(profit_increment=0.001, profit_threshold=0.003, profit_increment_scope="run")
+    sh._attach_run(5)
+    s.run_bumps = bumps
+    s.base_bet = s.current_bet = round(0.001 + bumps * 0.001, 8)
+    s.profit = profit
+    sh._save_run()
+    return s
+
+
+def test_live_base_change_zeroes_bumps_and_reanchors():
+    s = _bumped_daemon()
+    _write_cfg(base_bet=0.002, profit_increment=0.001, profit_threshold=0.003,
+               profit_increment_scope="run")
+
+    applied = sh._reload_live_config()
+
+    assert "base_bet" in applied
+    assert s.base_bet == pytest.approx(0.002) and s.current_bet == pytest.approx(0.002)
+    assert s.run_bumps == 0 and s.run_base_origin == pytest.approx(0.002)
+    assert s.next_profit_milestone == pytest.approx(0.009)    # above run profit 0.007
+    run = json.load(open(sh.RUN_PATH))
+    assert run["bumps"] == 0 and run["base"] == pytest.approx(0.002)
+
+
+def test_unrelated_reload_keeps_the_bumps():
+    s = _bumped_daemon()
+    _write_cfg(max_loss=5.0, profit_increment=0.001, profit_threshold=0.003,
+               profit_increment_scope="run")
+
+    applied = sh._reload_live_config()
+
+    assert "base_bet" not in applied
+    assert s.run_bumps == 5 and s.base_bet == pytest.approx(0.006)
+
+
+def test_base_change_without_a_run_only_sets_the_bet():
+    _cfg("session")
+    sh._rebase_run_for_base_change(0.002)
+    assert sh.state.base_bet == pytest.approx(0.002)
+    assert sh.state.current_bet == pytest.approx(0.002)
+    assert not os.path.exists(sh.RUN_PATH)
+
+
+def test_resume_drops_bumps_earned_on_another_base():
+    _seed(sh.DB_PATH, [(3, 0.025, 1)])
+    json.dump({"first_session": 3, "started_at": "x", "bumps": 4, "base": 0.002},
+              open(sh.RUN_PATH, "w"))
+    _cfg("run")
+    sh._init_run()
+    assert sh.state.run_bumps == 0
+    assert sh.state.base_bet == pytest.approx(0.001)
+    assert sh.state.next_profit_milestone == pytest.approx(0.03)  # above run profit 0.025
+    assert json.load(open(sh.RUN_PATH))["base"] == pytest.approx(0.001)
+
+
+def test_resume_applies_bumps_on_the_same_base():
+    _seed(sh.DB_PATH, [(3, 0.025, 1)])
+    json.dump({"first_session": 3, "started_at": "x", "bumps": 2, "base": 0.001},
+              open(sh.RUN_PATH, "w"))
+    _cfg("run")
+    sh._init_run()
+    assert sh.state.run_bumps == 2
+    assert sh.state.base_bet == pytest.approx(0.003)
+    assert sh.state.next_profit_milestone == pytest.approx(0.03)
+
+
+def test_legacy_run_file_keeps_bumps_once_and_adopts_the_base():
+    _seed(sh.DB_PATH, [(3, 0.025, 1)])
+    json.dump({"first_session": 3, "started_at": "x", "bumps": 2}, open(sh.RUN_PATH, "w"))
+    _cfg("run")
+    sh._init_run()
+    assert sh.state.run_bumps == 2
+    assert sh.state.run_base_origin == pytest.approx(0.001)
+    assert json.load(open(sh.RUN_PATH))["base"] == pytest.approx(0.001)
+
+
+def test_config_show_reports_the_live_base(capsys, monkeypatch):
+    _write_cfg()
+    monkeypatch.setattr(sh, "_monitor_read_state",
+                        lambda: {"pid": 4242, "base_bet": 0.006, "run_bumps": 5})
+    monkeypatch.setattr(sh, "_monitor_get_pid", lambda d: 4242)
+    monkeypatch.setattr(sh.console, "width", 250)
+    sh.cmd_config_show()
+    out = capsys.readouterr().out
+    assert "live 0.00600000" in out and "+5 bumps" in out
+
+
+def test_config_show_without_a_daemon_shows_the_file_only(capsys):
+    _write_cfg()
+    sh.cmd_config_show()
+    assert "live " not in capsys.readouterr().out
+
+
+def test_ctl_start_reports_an_already_active_unit():
+    src = open(os.path.join(os.path.dirname(sh.__file__), "shufflectl")).read()
+    start = src[src.index("cmd_start()"):src.index("cmd_stop()")]
+    assert "was_active" in start
+    assert "already running" in start
+    assert "shufflectl restart" in start
+
 # ══════════════════════════════════════════════════════════
 #  TELEGRAM
 # ══════════════════════════════════════════════════════════

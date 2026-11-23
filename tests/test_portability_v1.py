@@ -48,7 +48,7 @@ def _mk_engine(db):
 
 # ── VERSION ───────────────────────────────────────────────
 def test_cli_version():
-    assert sh.VERSION == "1.12.1"
+    assert sh.VERSION == "1.12.2"
 
 
 def test_tg_version():

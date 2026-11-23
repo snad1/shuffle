@@ -1,4 +1,4 @@
-"""E3-S2 — shuffle CLI betting behaviour (WolfBet CLI v2.16.0 … v2.32.1).
+"""shuffle CLI betting behaviour (WolfBet CLI v2.16.0 to v2.32.1).
 
 Mirrors wolfbet tests test_phase5f_recurring_delay, test_phase5o_config_persistence,
 test_phase5p_live_reload, test_phase5q_uptime_pause, test_phase5u_profit_increment_persistence,
@@ -324,7 +324,8 @@ def test_sighup_reloads_live_keys_only():
 
     assert (s.max_bets, s.recurring, s.streak_delay_loss) == (50, True, (3, 2.0))
     assert s.recurring_delay == 86400                     # clamped on reload too
-    assert (s.base_bet, s.currency) == (B, "usdt")        # not live-safe
+    assert s.currency == "usdt"                            # not live-safe
+    assert s.base_bet == 5.0                               # an operator-set base applies live
     assert (s.session_id, s.total_bets, s.profit) == (7, 4, 0.01)
 
 

@@ -30,7 +30,7 @@ from shared.core.lanes import (
 from shared.core.run_increment import (
     PROFIT_INCREMENT_SCOPES, check_profit_increment, db_max_session_id, increment_on,
     load_run, next_milestone, parse_scope, resume_base_bet, run_is_stale,
-    run_path as _run_path_for, run_profit_done, save_run,
+    run_path as _run_path_for, run_profit_done, save_run, bumps_for_base, rebaseline,
 )
 try:
     import readline
@@ -94,7 +94,7 @@ PID_PATH     = os.path.expanduser("~/.shuffle_autobot.pid")
 PRESET_PATH  = os.path.expanduser("~/.shuffle_presets.json")
 RUN_PATH     = os.environ.get("SHUFFLE_RUN_PATH", os.path.expanduser("~/.shuffle_run.json"))
 LOG_DIR      = os.path.expanduser("~/.shuffle_logs")
-VERSION      = "1.12.1"
+VERSION      = "1.12.2"
 MIN_BET      = 0.001   # Shuffle minimum bet
 APP_ENV      = os.environ.get("APP_ENV", "production")
 
@@ -503,13 +503,21 @@ def load_config() -> bool:
         merged, warn = lane_config(data, state.lane, _LANE_FORBIDDEN_KEYS, MIN_BET)
         if warn:
             logger.warning(warn)
-        state.base_bet_disk = data.get("base_bet")
-        mb = merged.get("base_bet")
-        state.base_bet_split = mb if mb != state.base_bet_disk else None
+        _remember_config_base(data, merged)
         _apply_loaded(merged, _CONFIG_KEYS)
         return True
     except Exception:
         return False
+
+def _remember_config_base(data: dict, merged: dict) -> None:
+    """Keep the file's base and this lane's split base apart from the live, bumped one."""
+    state.base_bet_disk = data.get("base_bet")
+    mb = merged.get("base_bet")
+    state.base_bet_split = mb if mb != state.base_bet_disk else None
+
+
+def _configured_base():
+    return state.base_bet_split if state.base_bet_split is not None else state.base_bet_disk
 
 # ===========================================================
 #  PRESETS
@@ -532,7 +540,7 @@ _PRESET_KEYS = [
 _LIVE_RELOAD_KEYS = {
     "recurring", "recurring_delay", "streak_reset_losses", "streak_reset_delay",
     "max_profit", "max_loss", "max_bets", "max_wins", "stop_on_balance",
-    "bet_delay", "basebet_pct",
+    "bet_delay", "basebet_pct", "base_bet",
     "streak_delay_loss", "streak_delay_win", "streak_delay_bets", "streakbet_loss",
     "milestone_bets", "milestone_wins", "milestone_losses", "milestone_profit",
     "profit_increment", "profit_threshold",
@@ -555,11 +563,13 @@ def _reload_live_config() -> dict:
         return {}
     # v1.10.0: merge this lane's overrides and bet split (WolfBet v2.35.0 / v2.36.0).
     # The lane count and split mode themselves apply on the next start.
-    data, _ = lane_config(data, state.lane, _LANE_FORBIDDEN_KEYS, MIN_BET)
+    raw, (data, _) = data, lane_config(data, state.lane, _LANE_FORBIDDEN_KEYS, MIN_BET)
     applied, skipped = {}, []
     tuple_keys = set(_STREAK_TUPLE_KEYS)
     with state.lock:
         for k, v in data.items():
+            if k == "base_bet":
+                continue
             new_val = parse_streak_delay(v) if k in tuple_keys else v
             old_val = getattr(state, k, None)
             if k in _LIVE_RELOAD_KEYS:
@@ -569,6 +579,14 @@ def _reload_live_config() -> dict:
             elif k in _CONFIG_KEYS and old_val != new_val:
                 skipped.append(k)
         _clamp_delays()
+    # The live base carries bumps, so a change is judged against the configured base.
+    new_base, old_base = data.get("base_bet"), _configured_base()
+    if old_base is None:
+        old_base = state.base_bet
+    if new_base is not None and abs(float(new_base) - float(old_base)) > 1e-12:
+        _remember_config_base(raw, data)
+        applied["base_bet"] = (state.base_bet, new_base)
+        _rebase_run_for_base_change(new_base)
     if {"proxy", "purge_days", "db_write_mode"} & set(applied):
         _sanitize_tooling_keys()
     if "custom_rules_text" in applied and state.custom_rules_text:
@@ -1119,6 +1137,7 @@ class BotState:
         self.run_since              : Optional[str] = None
         self.run_bumps              : int = 0
         self.run_profit_done        : float = 0.0  # finished sessions of this run
+        self.run_base_origin        : Optional[float] = None  # base the bumps were earned on
 
         # -- strategy internal state --
         self.dalembert_unit = 0
@@ -2261,7 +2280,8 @@ def _save_run() -> None:
     try:
         save_run(_run_path(), {"first_session": state.run_first_session,
                                "started_at": state.run_since,
-                               "bumps": state.run_bumps})
+                               "bumps": state.run_bumps,
+                               "base": state.run_base_origin})
     except OSError as e:
         logger.warning("run file save failed: %s", e)
 
@@ -2304,6 +2324,7 @@ def _init_run() -> None:
     state.run_first_session = None
     state.run_bumps = 0
     state.run_profit_done = 0.0
+    state.run_base_origin = None
     if state.profit_increment_scope != "run" or not _increment_on():
         _end_run("increment off" if state.profit_increment_scope == "run"
                  else "scope session")
@@ -2315,13 +2336,22 @@ def _init_run() -> None:
     if run:
         state.run_first_session = run["first_session"]
         state.run_since = run["started_at"]
-        state.run_bumps = run["bumps"]
+        state.run_bumps = bumps_for_base(run["bumps"], run["base"], state.base_bet)
+        dropped = state.run_bumps != run["bumps"]
+        if dropped:
+            logger.warning("RUN base changed (%.8f -> %.8f) - dropping %d bump(s), re-anchoring",
+                           run["base"], state.base_bet, run["bumps"])
+        state.run_base_origin = state.base_bet
         state.run_profit_done = _run_profit_done_from_db(run["first_session"])
         state.base_bet = resume_base_bet(state.base_bet, state.run_bumps,
                                          state.profit_increment)
         state.current_bet = state.base_bet
+        if run["base"] is None or dropped:
+            _save_run()
     if state.profit_threshold:
-        state.next_profit_milestone = next_milestone(state.run_bumps, state.profit_threshold)
+        state.next_profit_milestone = (
+            rebaseline(state.run_profit_done, state.profit_threshold) if run and dropped
+            else next_milestone(state.run_bumps, state.profit_threshold))
     logger.warning("RUN %s  since #%s  bumps=%d  run profit=%+.8f  base_bet=%.8f",
                    "resumed" if run else "new", state.run_first_session or "next",
                    state.run_bumps, state.run_profit_done, state.base_bet)
@@ -2339,6 +2369,7 @@ def _end_run(reason: str) -> None:
     state.run_since = None
     state.run_bumps = 0
     state.run_profit_done = 0.0
+    state.run_base_origin = None
     if had:
         logger.warning("RUN ended (%s) - the next run starts fresh", reason)
 
@@ -2349,6 +2380,22 @@ def _attach_run(session_id: int) -> None:
             and state.run_first_session is None):
         state.run_first_session = session_id
         state.run_since = datetime.now().isoformat()
+        state.run_base_origin = state.base_bet
+        _save_run()
+
+
+def _rebase_run_for_base_change(new_base: float) -> None:
+    """Make an operator-set base the one the bot bets for the rest of the run.
+
+    Bumps earned on the previous base are dropped and the milestone re-anchors
+    above the run's current profit, so the next bump needs fresh profit. No
+    lock: this runs in the SIGHUP handler, which the main thread may hold.
+    """
+    state.base_bet = state.current_bet = new_base
+    if state.profit_increment_scope == "run" and state.run_first_session is not None:
+        state.run_bumps = 0
+        state.run_base_origin = new_base
+        state.next_profit_milestone = rebaseline(run_profit_total(), state.profit_threshold)
         _save_run()
 
 
@@ -5407,8 +5454,18 @@ def cmd_config_show():
     tok_state = "[bold green](SET)[/]" if state.bearer_token else "[bold red](NOT SET)[/]"
     tbl.add_row("bearer_token", f"[dim]{_mask_key(state.bearer_token)}[/] {tok_state}",
                 "Shuffle Bearer token (set via the wizard)")
+    live = _monitor_read_state()
+    if not (live and _monitor_get_pid(live)):
+        live = None
     for field, desc in _CONFIG_SHOW_FIELDS:
-        tbl.add_row(field, _fmt_config_value(field, getattr(state, field, None)), desc)
+        val = getattr(state, field, None)
+        shown = _fmt_config_value(field, val)
+        if field == "base_bet" and live and live.get("base_bet") is not None and val is not None:
+            live_base = float(live["base_bet"])
+            if abs(live_base - float(val)) > 1e-12:
+                shown = (f"{shown}  [dim](live {live_base:.8f}, "
+                         f"+{int(live.get('run_bumps') or 0)} bumps)[/]")
+        tbl.add_row(field, shown, desc)
     console.print(tbl)
     _print_lanes_config()
     try:
