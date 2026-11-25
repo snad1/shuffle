@@ -1,4 +1,4 @@
-"""E4-S2 — shuffle CLI stats and analytics (WolfBet CLI v2.23.0 … v2.35.0).
+"""Shuffle CLI stats and analytics (WolfBet CLI v2.23.0 to v2.35.0).
 
 Mirrors wolfbet tests test_phase8_analytics, test_phase6d_reset_and_datestats (stats part),
 test_phase6e_analytics_dates, test_phase9c_stats_window_avgs, test_phase9d_durations and
@@ -219,11 +219,11 @@ def test_cli_analytics_and_lane_dispatch(monkeypatch):
 
 
 def test_cli_lane_out_of_range_exits(monkeypatch):
-    monkeypatch.setattr(sh.sys, "argv", ["shuffle.py", "--stats", "--lane", "11"])
+    monkeypatch.setattr(sh.sys, "argv", ["shuffle.py", "--stats", "--lane", "100"])
     with sh.console.capture() as cap, pytest.raises(SystemExit) as ex:
         sh.main()
     assert ex.value.code == 1
-    assert "--lane must be 1-10, got 11" in _plain(cap.get())
+    assert "--lane must be 1-99, got 100" in _plain(cap.get())
 
 
 def test_cli_stats_analytics_mutually_exclusive(monkeypatch):

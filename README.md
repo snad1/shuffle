@@ -149,7 +149,9 @@ shufflectl stats          # View all-time statistics (--since/--until for a wind
 shufflectl session ID     # Full stats + streak distribution
 shufflectl presets        # List saved presets
 shufflectl update         # Update bot from current directory
-shufflectl lanes [N] [--split none|budget|bet|both]  # Show or set parallel lanes (1-10)
+shufflectl lanes [N] [--split none|budget|bet|both] [--max N]  # Show or set parallel lanes; only the difference starts or stops
+shufflectl lane add NAME [--from K] | remove K | rename K NAME  # Change one lane; the others keep betting
+shufflectl start|stop|restart K   # One lane alone (lane 1 is the shuffle service)
 shufflectl diagnose         # Bottleneck analysis of the running session
 shufflectl benchmark [N] [--lanes M]  # Time N probe requests
 shufflectl doctor [--fix] [--yes]  # Health check; --fix applies safe fixes

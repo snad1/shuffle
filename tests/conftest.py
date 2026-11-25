@@ -51,6 +51,7 @@ def _sandbox(tmp_path, monkeypatch, sleeps):
     # swaps the log formatter, restored after each test.
     monkeypatch.setattr(sh, "_BASE_STATE_PATH", sh.STATE_PATH)
     monkeypatch.setattr(sh, "_BASE_PID_PATH", sh.PID_PATH)
+    monkeypatch.setattr(sh, "_log_tag", sh._log_tag)
     _fmt = sh._log_handler.formatter
     monkeypatch.setattr(tg_database, "DATA_DIR", str(tmp_path / "tg"))
     monkeypatch.setattr(sh, "state", sh.BotState())

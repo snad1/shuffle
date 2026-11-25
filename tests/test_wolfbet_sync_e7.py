@@ -1,4 +1,4 @@
-"""shufflectl + install.sh operations (shufflectl v1.1), mirroring wolfctl 3.12.
+"""shufflectl + install.sh operations (shufflectl v1.1, lanes from v1.2), mirroring wolfctl 3.12.
 
 The ctl runs for real under bash against a temp HOME. systemctl is a stub on
 PATH that keeps unit state in files (active / enabled), and the bot's python
@@ -38,7 +38,9 @@ for u in ${units[@]+"${units[@]}"}; do
         stop) rm -f "$st/$u.active" ;;
         enable) touch "$st/$u.enabled"; [ "$now" = 1 ] && touch "$st/$u.active" ;;
         disable) rm -f "$st/$u.enabled"; [ "$now" = 1 ] && rm -f "$st/$u.active" ;;
-        is-active) [ -f "$st/$u.active" ] || exit 3 ;;
+        is-active)
+            if [ -f "$st/$u.active" ]; then [ "$quiet" = 1 ] || echo active
+            else [ "$quiet" = 1 ] || echo inactive; exit 3; fi ;;
         is-enabled) [ -f "$st/$u.enabled" ] || exit 1 ;;
         status) [ -f "$st/$u.active" ] && echo "active" || exit 3 ;;
     esac
@@ -51,6 +53,22 @@ if [ "${1:-}" = "-" ] || [ "${1:-}" = "-c" ]; then
     exec "__REAL__" "$@"
 fi
 echo "$*" >> "$HOME/py.log"
+case "$*" in
+    *--config-set*|*--lane-add*|*--lane-remove*)
+        # A test that wants the bot's write to land puts the resulting config in config-after.json.
+        [ -f "$HOME/config-after.json" ] && mv "$HOME/config-after.json" "$HOME/.shuffle_autobot.json"
+        exit 0 ;;
+    *--lane-ids*)
+        # The registry is read the way shuffle.py reads it, from the real config file.
+        exec "__REAL__" -c 'import json, os, sys
+from shared.core.lanes import lane_registry
+try:
+    cfg = json.load(open(os.path.expanduser("~/.shuffle_autobot.json")))
+except Exception:
+    cfg = {}
+reg = lane_registry(cfg)
+print(" ".join(str(k) for k in sorted(reg) if sys.argv[1] == "all" or reg[k]["enabled"]))' "${3:-enabled}" ;;
+esac
 exit 0
 '''
 
@@ -102,7 +120,7 @@ def test_scripts_parse():
 
 
 def test_version_constant_is_grep_parsable():
-    assert "\nSHUFFLECTL_VERSION=1.1\n" in _CTL.read_text()
+    assert "\nSHUFFLECTL_VERSION=1.2\n" in _CTL.read_text()
 
 
 @pytest.mark.parametrize("cmd", [
@@ -136,7 +154,7 @@ def test_pass_through_calls_the_bot_flag(env, args, flags):
 
 
 def test_version_prints_the_ctl_version(env):
-    assert "shufflectl v1.1" in _ctl(env, "version").stdout
+    assert "shufflectl v1.2" in _ctl(env, "version").stdout
 
 
 def test_config_set_without_pairs_shows_usage(env):
@@ -177,6 +195,7 @@ def test_reset_answer_no_changes_nothing(env):
 
 
 def test_reset_stops_a_running_daemon_and_its_lanes(env):
+    _config(env, lanes=2)
     _stats_files(env)
     _ctl(env, "reset", "--yes")  # nothing running: no stop
     assert "stop shuffle\n" not in _log(env, "systemctl.log")
@@ -211,30 +230,49 @@ def test_run_reset_answer_no_does_nothing(env):
 
 
 # ── lanes ────────────────────────────────────────────────
-def test_lanes_n_writes_config_and_enables_lane_units(env):
-    _config(env, lanes=3)
+def _after(env, lanes):
+    (env["home"] / "config-after.json").write_text(
+        json.dumps({"base_bet": 0.001, "lanes": {"count": lanes, "split": "budget"}}))
+
+
+def test_lanes_n_on_a_stopped_bot_starts_nothing_and_says_how(env):
+    _config(env, lanes=1)
+    _after(env, 3)
     res = _ctl(env, "lanes", "3", "--split", "budget")
     assert "--config-set lanes=3 lane_split=budget" in _log(env, "py.log")
-    assert {"shuffle-lane@2.enabled", "shuffle-lane@3.enabled"} <= _units(env)
-    assert "shuffle-lane@2.active" not in _units(env)          # bot stopped: boot-enable only
+    assert not {u for u in _units(env) if u.startswith("shuffle-lane@")}
+    assert "lane 3 ready; start it with: shufflectl start 3" in res.stdout
+
+
+def test_lanes_n_on_a_running_bot_starts_only_the_new_lanes(env):
+    _config(env, lanes=1)
+    _after(env, 3)
+    (env["home"] / "units").mkdir()
+    (env["home"] / "units" / "shuffle.active").touch()
+    res = _ctl(env, "lanes", "3")
+    assert {"shuffle-lane@2.active", "shuffle-lane@3.active"} <= _units(env)
     unit = (env["home"] / ".config/systemd/user/shuffle-lane@.service").read_text()
     assert "--lane %i" in unit and "Nice=-5" in unit and "WantedBy=default.target" in unit
-    assert "start all 3 lane(s)" in res.stdout
+    log = _log(env, "systemctl.log")
+    assert "restart shuffle" not in log and "stop shuffle\n" not in log
+    assert "lane 2 started" in res.stdout and "Budget shares update when each lane restarts" in res.stdout
 
 
-def test_lanes_1_disables_lane_units(env):
-    _config(env, lanes=1)
+def test_lanes_1_stops_only_lanes_two_and_up(env):
+    _config(env, lanes=3)
+    _after(env, 1)
     (env["home"] / "units").mkdir()
-    for k in (2, 3):
-        (env["home"] / "units" / f"shuffle-lane@{k}.enabled").touch()
-        (env["home"] / "units" / f"shuffle-lane@{k}.active").touch()
+    for u in ("shuffle", "shuffle-lane@2", "shuffle-lane@3"):
+        (env["home"] / "units" / f"{u}.enabled").touch()
+        (env["home"] / "units" / f"{u}.active").touch()
     _ctl(env, "lanes", "1")
     assert not {u for u in _units(env) if u.startswith("shuffle-lane@")}
+    assert "shuffle.active" in _units(env)
 
 
 def test_lanes_rejects_bad_input(env):
-    assert _ctl(env, "lanes", "11").returncode == 1
     assert _ctl(env, "lanes", "x").returncode == 1
+    assert _ctl(env, "lanes", "--max", "x").returncode == 1
     assert _ctl(env, "lanes", "2", "--split", "half").returncode == 1
 
 
@@ -320,7 +358,7 @@ def test_update_autostashes_reinstalls_and_restarts_what_ran():
 def test_refresh_installs_a_newer_repo_copy(env, tmp_path):
     repo = tmp_path / "repo"
     repo.mkdir()
-    newer = _CTL.read_text().replace("\nSHUFFLECTL_VERSION=1.1\n", "\nSHUFFLECTL_VERSION=9.9\n")
+    newer = _CTL.read_text().replace("\nSHUFFLECTL_VERSION=1.2\n", "\nSHUFFLECTL_VERSION=9.9\n")
     (repo / "shufflectl").write_text(newer)
     local_bin = env["home"] / ".local" / "bin"
     local_bin.mkdir(parents=True)
@@ -330,7 +368,7 @@ def test_refresh_installs_a_newer_repo_copy(env, tmp_path):
 
     res = _ctl(env, "refresh", cwd=repo)
 
-    assert "shufflectl 1.1 -> 9.9 installed at" in res.stdout
+    assert "shufflectl 1.2 -> 9.9 installed at" in res.stdout
     assert installed.read_text() == newer
     assert stat.S_IMODE(installed.stat().st_mode) == 0o755
     assert "already current" in _ctl(env, "refresh", cwd=repo).stdout

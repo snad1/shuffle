@@ -1,4 +1,4 @@
-"""E5-S7 — parallel lanes in the shuffle CLI (WolfBet v2.35.0 / v2.36.0).
+"""Parallel lanes in the shuffle CLI (WolfBet v2.35.0 / v2.36.0).
 
 Modelled on wolfbet/tests/test_phase10_lanes.py. A lane is one process with
 module-global `state`, so the "two lanes" tests run each lane with its own
@@ -85,7 +85,7 @@ def test_apply_lane_one_keeps_classic_paths():
     assert "[L" not in sh._log_handler.formatter._fmt
 
 
-@pytest.mark.parametrize("bad", [0, 11, -1])
+@pytest.mark.parametrize("bad", [0, 100, -1])
 def test_apply_lane_range(bad):
     with pytest.raises(ValueError):
         sh._apply_lane(bad)
@@ -234,30 +234,30 @@ def test_config_set_lanes_and_overrides(no_signals):
     _config()
     out = _run(sh.cmd_config_set, ["lanes=2", "lane2.max_wins=3", "lane2.delay=0.5"])
     d = _disk()
-    assert d["lanes"]["count"] == 2
-    assert d["lanes"]["overrides"]["2"] == {"max_wins": 3, "bet_delay": 0.5}
+    assert sh.lanes_count(d) == 2
+    assert d["lanes"]["items"]["2"]["overrides"] == {"max_wins": 3, "bet_delay": 0.5}
     assert d["max_wins"] == 10 and d["bet_delay"] == 0       # base untouched
     assert no_signals == [[2]]
     assert "lane2.max_wins" in out
     out = _run(sh.cmd_config_set, ["lane2.max_wins=default"])
     assert "override removed" in out
-    assert _disk()["lanes"]["overrides"]["2"] == {"bet_delay": 0.5}
+    assert _disk()["lanes"]["items"]["2"]["overrides"] == {"bet_delay": 0.5}
     _run(sh.cmd_config_set, ["lane2.delay=inherit"])
-    assert "2" not in _disk()["lanes"]["overrides"]
+    assert _disk()["lanes"]["items"]["2"]["overrides"] == {}
 
 
 def test_config_set_lane_split(no_signals):
     _config()
     _run(sh.cmd_config_set, ["lanes=2", "lane_split=Both"])
     d = _disk()
-    assert d["lanes"] == {"count": 2, "overrides": {}, "split": "both"}
+    assert sh.lanes_count(d) == 2 and d["lanes"]["split"] == "both"
     assert d["base_bet"] == 0.004
 
 
 @pytest.mark.parametrize("pair", [
     "lane2.currency=btc", "lane2.proxy=off", "lane2.purge_days=5",
     "lane2.db_write_mode=sync", "lane2.bearer_token=x", "lane1.max_wins=3",
-    "lane11.max_wins=3", "lanes=0", "lanes=x", "lane_split=half", "lane2.lane_split=bet",
+    "lane100.max_wins=3", "lanes=0", "lanes=x", "lane_split=half", "lane2.lane_split=bet",
     "lane2.max_wins=abc",
 ])
 def test_config_set_bad_lane_pair_exits(pair, no_signals):
@@ -272,7 +272,7 @@ def test_config_set_bad_lane_pair_exits(pair, no_signals):
 def test_config_set_lane_value_validated_and_derived(no_signals):
     _config(game="dice")
     _run(sh.cmd_config_set, ["lane2.multiplier=4"])
-    ov = _disk()["lanes"]["overrides"]["2"]
+    ov = _disk()["lanes"]["items"]["2"]["overrides"]
     assert ov["multiplier_target"] == 4.0
     assert "dice_target" in ov
 

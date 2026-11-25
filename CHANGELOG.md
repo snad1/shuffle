@@ -1,5 +1,27 @@
 # Changelog
 
+## CLI v1.14.0 / shufflectl v1.2 - a lanes table, named lanes, one lane at a time (2026-11-25)
+
+Ports WolfBet's lane registry and one-lane verbs (WolfBet v2.48.0 to v2.49.0, wolfctl 3.22 to 3.24), the same code as goated 1.15.0. Needs casino-shared 0.10.0; with an older one the CLI prints `casino-shared 0.10.0 or newer is needed: run shufflectl update` and exits 1.
+
+### Lanes table
+- `shuffle.py --lanes-status` prints one row per lane (state, session, uptime, run, profit, equity, bps) and the totals; a Name column appears once a lane has its own name. `shufflectl status` and `shufflectl lanes` already called it, but the flag never existed, so the table was always empty.
+
+### Lanes
+- Lanes have an id and a name: `lanes: {split, max, next_id, items: {"<id>": {name, enabled, overrides}}}`. A config with `lanes.count` reads as lanes 1..count, as before; the first lane write keeps one copy at `~/.shuffle_autobot.json.pre-registry` (0600).
+- `shufflectl lane add NAME [--from K]` adds one lane (copying lane K's overrides) and starts only it. Ids are never reused.
+- `shufflectl lane remove K` stops and disables only that lane: `Lane K stopped. Other lanes keep betting.` Lane 1 holds the base config and can't be removed.
+- `shufflectl lane rename K NAME` (or `--config-set laneK.name=NAME`): the running lane reloads and logs `[L3 friend-A]`.
+- `shufflectl start|stop|restart K` acts on one lane alone; plain `start|stop|restart` still act on every lane.
+- `shufflectl lanes N` starts or stops only the difference and never restarts `shuffle`. With the `bet`/`both` split the running lanes reload their base bet share; `budget`/`both` print `Budget shares update when each lane restarts: shufflectl restart K.`
+- The owner limit `lanes.max` (default 10, up to 99): `shufflectl lanes --max N` or `--config-set lanes_max=N`. Lane ids go up to 99.
+- New bot flags: `--lanes-status`, `--lane-ids [enabled|all]`, `--lane-add NAME [--lane-from K]`, `--lane-remove K`.
+
+### Tests
+- `tests/test_lane_registry.py` (old shape read, `lanes=N` round trip, one-time backup, rename reloads one lane, add/remove, refusals write nothing, limit, ids above 10, `--lane-ids`, Name column, run reset, reload takes the count, the lanes table, an older casino-shared).
+- `tests/test_shufflectl_lanes.py` (add starts only the new unit, remove disables only its lane, rename, one-lane stop/start/restart, unknown lanes reach no unit, bad arguments exit 2, `--max`).
+- `tests/test_wolfbet_sync_e5_lanes.py`, `tests/test_wolfbet_sync_e4.py` and `tests/test_wolfbet_sync_e7.py` updated for the registry shape, ids up to 99 and the one-lane delta.
+
 ## shufflectl v1.1 + installer v1.1 - wolfctl 3.12 operations (2026-11-23)
 
 Mirrors wolfctl 3.12 and WolfBet's installer at CLI v2.37.2, as goatedctl 1.1 does. `shuffle.py` is unchanged; every new command calls a flag it already has.
