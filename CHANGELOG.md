@@ -1,5 +1,23 @@
 # Changelog
 
+## CLI v1.15.0 / TG v1.11.0 / shufflectl v1.3 - the token in the vault, a lane on its own account (2026-11-25)
+
+Ports WolfBet's key vault and per-lane accounts (WolfBet v2.51.0 to v2.53.0, v2.57.0), the same code as goated 1.16.0 without the device id (shuffle has none). Needs casino-shared 0.11.0; with an older one the CLI prints `casino-shared 0.11.0 or newer is needed: run shufflectl update` and exits 1.
+
+### Token vault
+- When lane 1 starts with `--resume` or `--daemon`, it stores the bearer token in the host vault as `default` (`~/.casino-vault/shuffle/default.json`, 0600). Once it reads back equal, `bearer_token` leaves `~/.shuffle_autobot.json`; one 0600 copy stays at `.pre-vault`. Saving the config never writes the token back. If the vault can't be used (`Key vault unavailable: <reason>` in the log), the config keeps its copy. Lanes 2+ only read.
+- `shufflectl key list | add ID [--label L] [--kind key|proxy|telegram] | rotate ID | delete ID`. The secret is read through a hidden prompt and goes to the bot on stdin, never in argv, output or the log. A key in use can't be deleted. The Telegram token is only ever `telegram`.
+- The Telegram bot reads its token from the vault (`telegram`) first, then `SHUFFLE_TG_TOKEN`.
+
+### A lane on its own account
+- A lane may set `key_ref` (a vault key), `currency`, `proxy` (no password) or `proxy_ref` (a vault proxy). `config-set` still refuses `bearer_token` and `token`, with or without a `laneK.` prefix. `currency` can now be set with `config-set` (restart to apply).
+- Saving a lane's key, currency or vault proxy restarts only the running lanes it changes: `Lane 3 restarted: its key, currency or proxy changed.`
+- A lane whose key or vault proxy is missing logs `Lane 3: key friend-a is not in the vault` and exits instead of betting from another account. `lane3.key_ref=nobody` is refused with `Invalid lane3 override: no key named nobody in the vault`; a lane proxy with a password is refused without being echoed.
+- The budget and bet splits count only the enabled lanes on the same key and currency. A vault proxy is never written to the config file.
+
+### Tests
+- `tests/test_lane_accounts.py`, `tests/test_shufflectl_lanes.py` (`key` verbs send the secret on stdin only). `tests/conftest.py` points the vault at each test's tmp dir. Lane tests updated where they pinned currency and proxy as lane-forbidden or set the lane count directly for the split.
+
 ## CLI v1.14.0 / shufflectl v1.2 - a lanes table, named lanes, one lane at a time (2026-11-25)
 
 Ports WolfBet's lane registry and one-lane verbs (WolfBet v2.48.0 to v2.49.0, wolfctl 3.22 to 3.24), the same code as goated 1.15.0. Needs casino-shared 0.10.0; with an older one the CLI prints `casino-shared 0.10.0 or newer is needed: run shufflectl update` and exits 1.

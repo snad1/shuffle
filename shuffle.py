@@ -22,8 +22,8 @@ from shared.core.database import ensure_sessions_lane, cleanup_old_bets, cleanup
 from shared.core.diagnostics import percentile, benchmark_verdict
 from shared.core.net import validate_proxy, mask_proxy
 from shared.core.validation import finite_float
-# The lane registry and its writers came with casino-shared 0.10.0; an older install lacks
-# them, so say how to fix it instead of a traceback.
+# The lane registry, its writers and the vault client came with casino-shared 0.11.0; an
+# older install lacks them, so say how to fix it instead of a traceback.
 try:
     from shared.core.lanes import (
         LANES_MAX, LANE_SPLIT_HELP, LANE_UNSET_VALUES, check_lane_keys, lane_budget_exceeded,
@@ -31,10 +31,11 @@ try:
         recommend_lanes, split_base_bet, split_budget_on,
         LANE_ID_MAX, LANE_NAME_HELP, LANE_NAME_RE, default_lane_name, lane_file_ids, lane_ids,
         lane_name, lane_overrides, lane_registry, lanes_max, next_lane_id, registry_block,
-        set_enabled_count, split_registry_pairs,
+        set_enabled_count, split_registry_pairs, account_lanes, lane_account,
     )
+    from shared.core.vault import KEY_ID_RE, Vault, VaultError, check_secret, vault_info, vault_secret
 except ImportError:
-    print("casino-shared 0.10.0 or newer is needed: run shufflectl update", file=sys.stderr)
+    print("casino-shared 0.11.0 or newer is needed: run shufflectl update", file=sys.stderr)
     sys.exit(1)
 from shared.core.run_increment import (
     PROFIT_INCREMENT_SCOPES, check_profit_increment, db_max_session_id, increment_on,
@@ -104,7 +105,7 @@ PID_PATH     = os.path.expanduser("~/.shuffle_autobot.pid")
 PRESET_PATH  = os.path.expanduser("~/.shuffle_presets.json")
 RUN_PATH     = os.environ.get("SHUFFLE_RUN_PATH", os.path.expanduser("~/.shuffle_run.json"))
 LOG_DIR      = os.path.expanduser("~/.shuffle_logs")
-VERSION      = "1.14.0"
+VERSION      = "1.15.0"
 MIN_BET      = 0.001   # Shuffle minimum bet
 APP_ENV      = os.environ.get("APP_ENV", "production")
 
@@ -126,10 +127,17 @@ logger.addHandler(_log_handler)
 # 2..N get `.laneK` state / pid files. Config file, DB and log file are shared.
 _BASE_STATE_PATH, _BASE_PID_PATH = STATE_PATH, PID_PATH
 
-# Keys that can't differ per lane: one account, one client setup, one DB.
+# Keys that can't differ per lane: the token itself (a lane names a vault key with key_ref),
+# the game and the storage settings. A lane may bet from its own account: key_ref,
+# currency and proxy / proxy_ref.
 _LANE_FORBIDDEN_KEYS = frozenset({
-    "bearer_token", "currency", "game", "proxy", "purge_days", "db_write_mode",
+    "bearer_token", "game", "purge_days", "db_write_mode",
 })
+
+# The host key vault: shuffle's main token is `default`, the Telegram bot token `telegram`.
+VAULT_SERVICE = "shuffle"
+VAULT_KEY_ID = "default"
+TG_KEY_ID = "telegram"
 
 CURRENCIES = ["btc", "eth", "ltc", "doge", "trx", "bch", "xrp", "usdt", "bnb", "ada", "matic", "shib"]
 
@@ -392,6 +400,7 @@ _CONFIG_KEYS = [
     "streak_reset_losses", "streak_reset_delay",
     # v1.9.0: WolfBet v2.26.0 / v2.27.0 tooling keys.
     "proxy", "purge_days", "db_write_mode",
+    "key_ref", "proxy_ref",
 ]
 
 # (N, X) tuples, stored on disk as "N:X" strings (null when off), WolfBet v2.28.2.
@@ -486,19 +495,92 @@ def save_config():
     if state.lane > 1:
         logger.info("save_config skipped on lane %d (base config is lane 1's)", state.lane)
         return
+    old = _read_config_raw()
     data = _serialize_keys(_CONFIG_KEYS)
     # An untouched split bet is saved as the full bet, so a reload doesn't split it twice.
     if state.base_bet_split is not None and state.base_bet == state.base_bet_split:
         data["base_bet"] = state.base_bet_disk
-    try:
-        with open(CONFIG_PATH) as f:
-            old = json.load(f)
-        if isinstance(old, dict) and "lanes" in old:
-            data["lanes"] = old["lanes"]
-    except (OSError, ValueError):
-        pass
+    if "lanes" in old:
+        data["lanes"] = old["lanes"]
+    # A vault proxy carries a password: the file keeps its own proxy value, never the vault's.
+    if state.proxy_ref:
+        data["proxy"] = old.get("proxy")
+    # The token lives in the vault once it reads back equal; the file keeps a copy only while
+    # the vault can't take it, and never another account's token.
+    if _store_token_in_vault():
+        if "bearer_token" in old:
+            _backup_config_once(".pre-vault", "moving the token to the vault")
+        data.pop("bearer_token", None)
+    elif state.key_ref != VAULT_KEY_ID:
+        if "bearer_token" in old:
+            data["bearer_token"] = old["bearer_token"]
+        else:
+            data.pop("bearer_token", None)
     _write_config_raw(data)
-    logger.info("Config saved (token=%s)", _mask_key(data.get("bearer_token", "")))
+    logger.info("Config saved (token=%s)", _mask_key(state.bearer_token))
+
+
+def _active_token(config_token: str, key_ref: str = VAULT_KEY_ID) -> str:
+    """The token this lane bets with. For `default`: the config's copy (only there while the
+    vault can't take it), else the vault. Any other key comes from the vault only."""
+    if key_ref != VAULT_KEY_ID:
+        return vault_secret(VAULT_SERVICE, key_ref, log=logger) or ""
+    return config_token or vault_secret(VAULT_SERVICE, VAULT_KEY_ID, log=logger) or ""
+
+
+def _vault_proxy(merged: dict):
+    """(proxy URL, problem): the vault proxy a lane names with proxy_ref, else its own proxy."""
+    ref = merged.get("proxy_ref")
+    if not ref:
+        return merged.get("proxy"), None
+    url = vault_secret(VAULT_SERVICE, ref, "proxy", log=logger)
+    if url is None:
+        return None, f"Lane {state.lane}: proxy {ref} is not in the vault"
+    return url, None
+
+
+def _store_token_in_vault() -> bool:
+    """Make the vault's default equal the token in use (lane 1 only). True once it reads back equal."""
+    if state.lane > 1 or not state.bearer_token or state.key_ref != VAULT_KEY_ID:
+        return False
+    try:
+        vault = Vault(VAULT_SERVICE)
+        if vault.secret(VAULT_KEY_ID) != state.bearer_token:
+            vault.put(VAULT_KEY_ID, state.bearer_token, "Shuffle main token")
+            logger.info("Bearer token stored in the vault as %s", VAULT_KEY_ID)
+        return vault.secret(VAULT_KEY_ID) == state.bearer_token
+    except (VaultError, OSError) as e:
+        logger.warning("Key vault unavailable: %s", e)
+        return False
+
+
+def _sync_vault_token() -> None:
+    """Move the token into the vault, then drop the config file's plaintext copy (one backup kept)."""
+    if not _store_token_in_vault():
+        return
+    raw = _read_config_raw()
+    if "bearer_token" not in raw:
+        return
+    _backup_config_once(".pre-vault", "moving the token to the vault")
+    raw.pop("bearer_token")
+    _write_config_raw(raw)
+    logger.info("Bearer token removed from %s; the vault keeps it", CONFIG_PATH)
+
+
+def _apply_lane_account(data: dict, merged: dict) -> None:
+    """This lane's token, vault proxy and same-account split, read at start: a lane whose key
+    or proxy is missing gets an `account_problem` instead of another account's."""
+    state.split_lanes = account_lanes(data, state.lane, _LANE_FORBIDDEN_KEYS, VAULT_KEY_ID)
+    state.key_ref = merged.get("key_ref") or VAULT_KEY_ID
+    state.proxy_ref = merged.get("proxy_ref") or None
+    problem = None
+    if state.proxy_ref:                   # a plain proxy was already checked on load
+        state.proxy, problem = _vault_proxy(merged)
+    state.bearer_token = _active_token(data.get("bearer_token") or "", state.key_ref)
+    if problem is None and not state.bearer_token and state.key_ref != VAULT_KEY_ID:
+        problem = f"Lane {state.lane}: key {state.key_ref} is not in the vault"
+    state.account_problem = problem
+
 
 def load_config() -> bool:
     if not os.path.exists(CONFIG_PATH):
@@ -515,6 +597,7 @@ def load_config() -> bool:
             logger.warning(warn)
         _remember_config_base(data, merged)
         _apply_loaded(merged, _CONFIG_KEYS)
+        _apply_lane_account(data, merged)
         return True
     except Exception:
         return False
@@ -574,7 +657,9 @@ def _reload_live_config() -> dict:
     # v1.10.0: merge this lane's overrides and bet split (WolfBet v2.35.0 / v2.36.0).
     # The lane count and split mode themselves apply on the next start.
     raw, (data, _) = data, lane_config(data, state.lane, _LANE_FORBIDDEN_KEYS, MIN_BET)
+    data["proxy"] = _vault_proxy(data)[0]
     state.lanes_count = lanes_count(raw)
+    state.split_lanes = account_lanes(raw, state.lane, _LANE_FORBIDDEN_KEYS, VAULT_KEY_ID)
     _set_lane_log_prefix(state.lane, lane_name(raw, state.lane))
     applied, skipped = {}, []
     tuple_keys = set(_STREAK_TUPLE_KEYS)
@@ -1199,6 +1284,10 @@ class BotState:
         # -- v1.10.0 parallel lanes (WolfBet v2.35.0 / v2.36.0) --
         self.lane            : int = 1
         self.lanes_count     : int = 1
+        self.split_lanes     : int = 1    # enabled lanes on this lane's account (key + currency)
+        self.key_ref         : str = "default"
+        self.proxy_ref       : Optional[str] = None
+        self.account_problem : Optional[str] = None
         self.lane_split      : str = "none"
         self.lane_share      : Optional[float] = None   # None = no lane budget
         self.lane_run_profit : float = 0.0               # closed cycles of this run
@@ -1252,9 +1341,9 @@ def _lane_equity():
 
 def _init_lane_budget() -> None:
     """Set this lane's share of the balance at bot start (`budget` / `both` split only)."""
-    state.lane_share = lane_share(state.current_balance, state.lanes_count, state.lane_split)
+    state.lane_share = lane_share(state.current_balance, state.split_lanes, state.lane_split)
     if state.lane_share is not None:
-        logger.warning("LANE %d/%d share=%.8f %s (split %s)", state.lane, state.lanes_count,
+        logger.warning("LANE %d/%d share=%.8f %s (split %s)", state.lane, state.split_lanes,
                        state.lane_share, state.currency.upper(), state.lane_split)
 
 
@@ -1411,8 +1500,8 @@ def _check_risky_config() -> list:
             "to establish a floor."
         )
     # v1.10.0: with a lane budget only the lane's share backs the chain.
-    lane_budget = split_budget_on(state.lanes_count, state.lane_split)
-    bank = bal / state.lanes_count if lane_budget else bal
+    lane_budget = split_budget_on(state.split_lanes, state.lane_split)
+    bank = bal / state.split_lanes if lane_budget else bal
     depth = martingale_chain_depth(bank, float(state.base_bet or 0), loss_mult)
     if sk in ("2", "6") and state.streak_reset_losses and state.max_loss is None and depth:
         warnings.append(
@@ -1509,6 +1598,7 @@ _TWEAK_PARAMS = {
     "streak_reset_losses", "streak_reset_delay",
     "base_bet", "multiplier_target", "loss_mult", "win_mult",
     "proxy", "purge_days", "db_write_mode",
+    "currency", "key_ref", "proxy_ref",
 }
 _TWEAK_OFF_VALUES = (None, "", "off", "none", "0", "disable", "false", "no", "n")
 
@@ -1651,6 +1741,28 @@ def _apply_mutation(changes: dict) -> list:
             raise ValueError(f"proxy: {e}")
         _apply_proxy_to_session()
         msgs.append(f"Proxy: {mask_proxy(state.proxy)}")
+
+    if "currency" in changes:
+        cur = str(changes["currency"] or "").strip().lower()
+        if cur not in CURRENCIES:
+            raise ValueError(f"currency must be one of {', '.join(CURRENCIES)}, got {changes['currency']!r}")
+        state.currency = cur
+        msgs.append(f"Currency: {cur.upper()} (restart to apply)")
+
+    # Lane accounts: a vault key and a vault proxy, by id; each must exist and be of its kind.
+    for ref_key, kind in (("key_ref", "key"), ("proxy_ref", "proxy")):
+        if ref_key not in changes:
+            continue
+        ref = str(changes[ref_key] or "").strip().lower()
+        if ref_key == "proxy_ref" and _is_off(ref):
+            state.proxy_ref = None
+            msgs.append("Proxy from the vault: off (restart to apply)")
+            continue
+        info = vault_info(VAULT_SERVICE, ref, log=logger)
+        if info is None or info.kind != kind:
+            raise ValueError(f"no {kind} named {ref} in the vault")
+        setattr(state, ref_key, ref)
+        msgs.append(f"{'Key' if kind == 'key' else 'Proxy'}: {ref} (restart to apply)")
 
     if "purge_days" in changes:
         v = changes["purge_days"]
@@ -1930,7 +2042,7 @@ def _apply_basebet_pct() -> bool:
     # v1.11.0: a split bet that rounds to 0 or is below MIN_BET stays full.
     new_base, note = split_base_bet(
         round(state.current_balance * state.basebet_pct, 8),
-        state.lanes_count, state.lane_split, False, MIN_BET)
+        state.split_lanes, state.lane_split, False, MIN_BET)
     if note:
         logger.warning(note)
     if new_base <= 0 or abs(new_base - state.base_bet) < 1e-12:
@@ -5637,6 +5749,12 @@ def _load_and_connect():
     if not load_config():
         console.print("[red]No saved config found. Run without --resume first.[/]")
         sys.exit(1)
+    if state.account_problem:
+        logger.error("%s", state.account_problem)
+        console.print(f"[red]{escape(state.account_problem)}. Add it with shufflectl key add "
+                      "or fix the lane.[/]")
+        sys.exit(1)
+    _sync_vault_token()
     console.print("[dim]Loading saved config...[/]")
     game_label = GAMES.get(state.game, {}).get("label", state.game)
     try:
@@ -5818,6 +5936,9 @@ def _lane_override_changes(pairs: list):
         key = key.strip().lower()
         canonical = _TWEAK_ALIAS.get(key, key)
         check_lane_keys([key, canonical], _LANE_FORBIDDEN_KEYS)
+        if canonical == "proxy" and "@" in val:
+            raise ValueError("a proxy with a password goes in the vault: add it with "
+                             "shufflectl key add ID --kind proxy and set proxy_ref")
         if val.strip().lower() in LANE_UNSET_VALUES:
             removals.append(canonical)
         else:
@@ -5932,7 +6053,7 @@ def _cmd_config_set_lanes(per_lane: dict, block: dict) -> None:
         try:
             changes, removals = _lane_override_changes(lane_pairs)
         except ValueError as e:
-            console.print(f"[red]Invalid lane setting:[/] {e}")
+            console.print(f"[red]Invalid lane{lane} override:[/] {e}")
             sys.exit(2)
         ov = entry["overrides"]
         for key in removals:
@@ -6094,9 +6215,66 @@ def _parse_config_set_pairs(pairs: list) -> dict:
 
 
 def cmd_config_set(pairs: list):
+    """Apply KEY=VALUE to the saved config, then restart the lanes whose account changed."""
+    before = _lane_accounts(_read_config_raw())
+    _config_set_write(pairs)
+    _restart_changed_lanes(before, _lane_accounts(_read_config_raw()))
+
+
+def _lane_accounts(raw: dict) -> dict:
+    """{lane: (key_ref, currency, proxy_ref)} for the enabled lanes: what a restart must pick
+    up. A plain proxy URL applies live, so it is not part of it."""
+    reg = lane_registry(raw)
+    out = {}
+    for lane in sorted(reg):
+        if reg[lane]["enabled"]:
+            key_ref, currency, _, proxy_ref = lane_account(raw, lane, _LANE_FORBIDDEN_KEYS,
+                                                           VAULT_KEY_ID)
+            out[lane] = (key_ref, currency, proxy_ref)
+    return out
+
+
+def _lane_running(lane: int) -> bool:
+    try:
+        with open(lane_path(_BASE_PID_PATH, lane)) as f:
+            os.kill(int(f.read().strip()), 0)
+        return True
+    except (OSError, ValueError):
+        return False
+
+
+def _restart_lane(lane: int) -> bool:
+    """Restart one lane's unit (lane 1 is the main service). False when systemd can't do it."""
+    import shutil
+    import subprocess
+    systemctl = shutil.which("systemctl")
+    if not systemctl:
+        return False
+    unit = "shuffle" if lane <= 1 else f"shuffle-lane@{lane}"
+    try:
+        done = subprocess.run([systemctl, "--user", "restart", unit],
+                              capture_output=True, timeout=60)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return done.returncode == 0
+
+
+def _restart_changed_lanes(before: dict, after: dict) -> None:
+    """Restart, one by one, the running lanes whose key, currency or vault proxy changed."""
+    for lane, account in after.items():
+        if lane not in before or before[lane] == account or not _lane_running(lane):
+            continue
+        if _restart_lane(lane):
+            console.print(f"Lane {lane} restarted: its key, currency or proxy changed.")
+        else:
+            console.print(f"[yellow]Restart lane {lane} to apply: [cyan]shufflectl restart {lane}[/][/]")
+
+
+def _config_set_write(pairs: list):
     """Apply KEY=VALUE mutations to the saved config, save, and SIGHUP a running daemon."""
     for p in pairs:
-        if p.strip().lower().startswith(("bearer_token=", "token=")):
+        key = p.split("=", 1)[0].strip().lower()
+        if key.split(".", 1)[-1] in ("bearer_token", "token"):
             console.print("[red]Refusing to write bearer_token via --config-set.[/]")
             console.print("[dim]  Set it with the wizard (--setup-only) so it never lands "
                           "in shell history / process args.[/]")
@@ -6160,6 +6338,75 @@ def cmd_config_set(pairs: list):
         n = _signal_lane_daemons()
         if n:
             console.print(f"[dim]Reloaded {n} running lane(s).[/]")
+
+
+def _key_users(key_id: str, kind: str) -> list:
+    """The enabled lanes that bet with vault entry `key_id`: as their key, or their proxy."""
+    if kind == "telegram":
+        return []
+    at = 0 if kind == "key" else 2
+    return [lane for lane, account in _lane_accounts(_read_config_raw()).items()
+            if account[at] == key_id]
+
+
+def _read_secret(kind: str) -> str:
+    """One line of stdin: a secret travels there so it never shows in a process list."""
+    secret = sys.stdin.readline().rstrip("\r\n")
+    check_secret(secret, kind)
+    return secret
+
+
+def cmd_key(action: str, key_id: Optional[str] = None, label: Optional[str] = None,
+            kind: str = "key") -> int:
+    """List, add, rotate or delete vault entries. No secret is ever printed or logged."""
+    try:
+        vault = Vault(VAULT_SERVICE)
+        if action == "list":
+            t = Table(title="Vault keys", title_style="bold cyan", box=box.SIMPLE)
+            for col in ("Id", "Kind", "Label", "Ends", "Lanes"):
+                t.add_column(col)
+            for info in vault.keys():
+                lanes = ", ".join(str(k) for k in _key_users(info.key_id, info.kind)) or "-"
+                t.add_row(info.key_id, info.kind, escape(info.label), info.last4, lanes)
+            console.print(t)
+            return 0
+        if not KEY_ID_RE.match(key_id or ""):
+            raise ValueError("key id must be 1-32 lowercase letters, digits, _ or -")
+        old = vault.info(key_id)
+        if action == "put":
+            if (kind == "telegram") != (key_id == TG_KEY_ID):
+                raise ValueError(f"The Telegram bot token is stored as {TG_KEY_ID}, and only there.")
+            if old is not None:
+                raise ValueError(f"A key named {key_id} already exists.")
+        elif old is None:
+            raise ValueError(f"No key named {key_id}.")
+        if action == "delete":
+            users = _key_users(key_id, old.kind)
+            if users:
+                raise ValueError(f"This key is used by lane {', '.join(str(k) for k in users)}. "
+                                 "Move the lanes to another key first.")
+            vault.delete(key_id)
+            logger.info("Vault key %s deleted", key_id)
+            console.print(f"Key {key_id} deleted.")
+            return 0
+        kind = old.kind if old else kind
+        info = vault.put(key_id, _read_secret(kind), label or (old.label if old else key_id),
+                         kind=kind)
+    except ValueError as e:
+        console.print(f"[red]{escape(str(e))}[/]")
+        return 2
+    except (VaultError, OSError) as e:
+        logger.warning("Key vault unavailable: %s", e)
+        console.print("[red]The key vault can't be used on this host.[/]")
+        return 1
+    logger.info("Vault key %s %s", key_id, "added" if action == "put" else "rotated")
+    done = "added" if action == "put" else "rotated"
+    console.print(f"Key {key_id} {done} (ends {info.last4}).")
+    if kind == "telegram":
+        console.print("Restart the Telegram bot to use it: shufflectl tg restart")
+    elif action == "rotate":
+        console.print("Lanes using it pick up the new one when they restart.")
+    return 0
 
 
 # ===========================================================
@@ -6459,6 +6706,10 @@ def main():
                        help="Add one lane named NAME; the other lanes keep betting")
     group.add_argument("--lane-remove", type=int, metavar="K",
                        help="Remove lane K from the registry (lane 1 can't be removed)")
+    group.add_argument("--key-list", action="store_true", help="List the vault keys (no secrets)")
+    group.add_argument("--key-put", metavar="ID", help="Add vault key ID; the secret is read from stdin")
+    group.add_argument("--key-rotate", metavar="ID", help="Replace vault key ID; the secret is read from stdin")
+    group.add_argument("--key-delete", metavar="ID", help="Delete vault key ID (refused while a lane uses it)")
     group.add_argument("--run-reset", action="store_true",
                        help="Delete the run-wide profit increment file(s); the next start "
                             "begins a new run total (with --lane K, only that lane)")
@@ -6490,6 +6741,9 @@ def main():
                         help="Parallel lane to run or inspect (1-99, default 1): own state / pid "
                              "files and [LK] log prefix; with --stats/--analytics only that "
                              "lane's sessions")
+    parser.add_argument("--key-label", metavar="LABEL", help="With --key-put: a label (default: the id)")
+    parser.add_argument("--key-kind", choices=("key", "proxy", "telegram"), default="key",
+                        help="With --key-put: what the entry holds (default: key)")
     parser.add_argument("--lane-from", type=int, metavar="K", default=None,
                         help="With --lane-add: copy lane K's overrides (default: lane 1, none)")
     parser.add_argument("--lanes", type=int, metavar="M", default=None,
@@ -6553,6 +6807,12 @@ def main():
         sys.exit(cmd_lane_add(args.lane_add, args.lane_from))
     if args.lane_remove is not None:
         sys.exit(cmd_lane_remove(args.lane_remove))
+    if args.key_list:
+        sys.exit(cmd_key("list"))
+    for action, key_id in (("put", args.key_put), ("rotate", args.key_rotate),
+                           ("delete", args.key_delete)):
+        if key_id is not None:
+            sys.exit(cmd_key(action, key_id, args.key_label, args.key_kind))
     if args.list_presets:
         cmd_list_presets()
         return

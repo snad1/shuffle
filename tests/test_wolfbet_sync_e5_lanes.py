@@ -138,7 +138,7 @@ def test_load_config_applies_lane_overrides():
     assert s.base_bet == s.current_bet == 0.002
     assert s.max_wins == 3
     assert s.streak_delay_loss == (3, 1.5)
-    assert s.currency == "usdt"          # forbidden per lane: base wins
+    assert s.currency == "btc"           # a lane may bet in its own currency
     sh.state = sh.BotState()
     s = _load_lane(1, lanes=lanes)
     assert s.base_bet == 0.004 and s.max_wins == 10
@@ -222,7 +222,7 @@ def test_split_bet_save_config_writes_full_bet():
 def test_split_basebet_pct_divided():
     s = sh.state
     s.current_balance, s.basebet_pct, s.base_bet = 1.0, 0.01, 0.001
-    s.lanes_count, s.lane_split = 2, "bet"
+    s.lanes_count, s.split_lanes, s.lane_split = 2, 2, "bet"
     assert sh._apply_basebet_pct() and s.base_bet == 0.005
     s.lane_split = "none"
     assert sh._apply_basebet_pct() and s.base_bet == 0.01
@@ -255,7 +255,7 @@ def test_config_set_lane_split(no_signals):
 
 
 @pytest.mark.parametrize("pair", [
-    "lane2.currency=btc", "lane2.proxy=off", "lane2.purge_days=5",
+    "lane2.currency=zzz", "lane2.proxy=socks5://u:pw@10.0.0.1:1080", "lane2.purge_days=5",
     "lane2.db_write_mode=sync", "lane2.bearer_token=x", "lane1.max_wins=3",
     "lane100.max_wins=3", "lanes=0", "lanes=x", "lane_split=half", "lane2.lane_split=bet",
     "lane2.max_wins=abc",
@@ -302,12 +302,12 @@ def test_config_show_prints_lanes_split_and_overrides():
 
 def test_init_lane_budget_per_mode():
     s = sh.state
-    s.current_balance, s.lanes_count = 1.0, 4
+    s.current_balance, s.lanes_count, s.split_lanes = 1.0, 4, 4
     for mode, share in (("none", None), ("bet", None), ("budget", 0.25), ("both", 0.25)):
         s.lane_split = mode
         sh._init_lane_budget()
         assert s.lane_share == share
-    s.lanes_count, s.lane_split = 1, "budget"
+    s.lanes_count, s.split_lanes, s.lane_split = 1, 1, "budget"
     sh._init_lane_budget()
     assert s.lane_share is None
 
@@ -349,7 +349,7 @@ def test_risky_config_uses_lane_share():
     s = sh.state
     s.current_balance, s.base_bet, s.loss_mult = 1.0, 0.001, 2.0
     s.strategy_key, s.streak_reset_losses, s.max_loss = "2", 3, None
-    s.lanes_count, s.lane_split = 4, "budget"
+    s.lanes_count, s.split_lanes, s.lane_split = 4, 4, "budget"
     assert any("lane share covers a" in w for w in sh._check_risky_config())
     s.lane_split = "none"
     assert any("balance covers a" in w for w in sh._check_risky_config())
@@ -357,7 +357,7 @@ def test_risky_config_uses_lane_share():
 
 def test_state_file_writes_lane_fields():
     s = sh.state
-    s.lane, s.lanes_count, s.lane_split, s.lane_share = 2, 2, "both", 0.5
+    s.lane, s.lanes_count, s.split_lanes, s.lane_split, s.lane_share = 2, 2, 2, "both", 0.5
     s.lane_run_profit, s.profit = 0.1, -0.05
     sh._save_state_file()
     with open(sh.STATE_PATH) as f:

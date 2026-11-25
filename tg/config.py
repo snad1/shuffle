@@ -1,11 +1,24 @@
-"""Configuration — environment variables, constants, tier definitions."""
+"""Configuration: environment variables, constants, tier definitions."""
 
 import os
 import logging
 
+TG_KEY_ID = "telegram"
+
+
+def bot_token() -> str:
+    """The bot token from the host key vault, else SHUFFLE_TG_TOKEN; never logged."""
+    try:
+        from shared.core.vault import vault_secret
+    except ImportError:
+        return os.environ.get("SHUFFLE_TG_TOKEN", "")
+    token = vault_secret("shuffle", TG_KEY_ID, "telegram", log=logging.getLogger("shufflebot"))
+    return token or os.environ.get("SHUFFLE_TG_TOKEN", "")
+
+
 # ── Environment ──────────────────────────────────────────
 APP_ENV   = os.environ.get("APP_ENV", "production")
-BOT_TOKEN = os.environ.get("SHUFFLE_TG_TOKEN", "")
+BOT_TOKEN = bot_token()
 DATA_DIR  = os.environ.get("SHUFFLE_TG_DATA", os.path.expanduser("~/.shufflebot_tg"))
 WEB_URL   = os.environ.get("SHUFFLE_WEB_URL", "")          # e.g. http://IP:8001
 WEB_SECRET = os.environ.get("SHUFFLE_WEB_SECRET_KEY", "")   # must match web app

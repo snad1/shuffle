@@ -98,3 +98,32 @@ def test_lanes_max_only_sets_the_limit(env):
     assert res.returncode == 0 and "Lane limit set to 5." in res.stdout
     assert "--config-set lanes_max=5" in _log(env, "py.log")
     assert "shuffle-lane@2.active" in _units(env)
+
+
+SECRET = "shuffle-friend-token-fedcba9876543210"
+
+
+def test_key_add_hands_the_secret_to_the_bot_on_stdin_only(env):
+    res = _ctl(env, "key", "add", "friend-a", "--label", "Friend A", stdin=SECRET + "\n")
+    assert res.returncode == 0, res.stderr
+    log = _log(env, "py.log")
+    assert "--key-put friend-a --key-kind key --key-label Friend A" in log
+    assert SECRET not in log and SECRET not in res.stdout and SECRET not in res.stderr
+    assert _log(env, "stdin.txt") == SECRET + "\n"
+
+
+def test_key_rotate_list_and_delete_reach_the_bot(env):
+    assert _ctl(env, "key", "rotate", "friend-a", stdin=SECRET + "\n").returncode == 0
+    assert _log(env, "stdin.txt") == SECRET + "\n"
+    assert _ctl(env, "key", "list").returncode == 0
+    assert _ctl(env, "key", "delete", "friend-a").returncode == 0
+    log = _log(env, "py.log")
+    assert "--key-rotate friend-a" in log and "--key-list" in log and "--key-delete friend-a" in log
+    assert SECRET not in log
+
+
+def test_bad_key_arguments_exit_2_and_reach_no_bot(env):
+    for args in (("key",), ("key", "add"), ("key", "add", "x", "--kind", "cookie"),
+                 ("key", "rotate", "x", "--label", "y"), ("key", "delete"), ("key", "list", "x")):
+        assert _ctl(env, *args, stdin=SECRET + "\n").returncode == 2, args
+    assert "--key-" not in _log(env, "py.log")

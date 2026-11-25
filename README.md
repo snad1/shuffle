@@ -152,6 +152,8 @@ shufflectl update         # Update bot from current directory
 shufflectl lanes [N] [--split none|budget|bet|both] [--max N]  # Show or set parallel lanes; only the difference starts or stops
 shufflectl lane add NAME [--from K] | remove K | rename K NAME  # Change one lane; the others keep betting
 shufflectl start|stop|restart K   # One lane alone (lane 1 is the shuffle service)
+shufflectl key list | add ID [--label L] [--kind key|proxy|telegram] | rotate ID | delete ID  # Vault tokens, proxies, Telegram token (hidden prompt)
+shufflectl config-set lane3.key_ref=friend-a lane3.currency=trx lane3.proxy_ref=friend-px  # Lane 3 on a friend's account; only lane 3 restarts
 shufflectl diagnose         # Bottleneck analysis of the running session
 shufflectl benchmark [N] [--lanes M]  # Time N probe requests
 shufflectl doctor [--fix] [--yes]  # Health check; --fix applies safe fixes

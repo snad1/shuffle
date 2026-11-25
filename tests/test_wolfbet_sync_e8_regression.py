@@ -79,7 +79,7 @@ def _setup_lane(mod, lane, casino, monkeypatch, **kw):
     s.multiplier_target, s.strategy, s.strategy_key = 2.0, "Flat Bet", "1"
     s.base_bet = s.current_bet = sh.MIN_BET
     s.db_write_mode = "sync"
-    s.lanes_count, s.lane_split = 2, "budget"
+    s.lanes_count, s.split_lanes, s.lane_split = 2, 2, "budget"
     for k, v in kw.items():
         setattr(s, k, v)
     s.start_balance = s.current_balance = casino.balance
