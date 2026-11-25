@@ -1,4 +1,4 @@
-"""E5-S2 — shuffle CLI observability and tooling (WolfBet CLI v2.17.0 … v2.30.5).
+"""Shuffle CLI observability and tooling (WolfBet CLI v2.17.0 to v2.30.5).
 
 Mirrors wolfbet tests test_phase3_metrics, test_phase5i_diagnostics, test_phase5g_proxy,
 test_phase5h_purge_days, test_phase5j_async_writer, test_phase4a_presets,
@@ -460,7 +460,7 @@ def test_main_drains_writer_on_every_exit_path():
 def test_new_keys_in_every_list():
     for k in ("proxy", "purge_days", "db_write_mode"):
         assert k in sh._CONFIG_KEYS and k in sh._PRESET_KEYS
-        assert k in sh._LIVE_RELOAD_KEYS and k in sh._TWEAK_PARAMS
+        assert k in sh._SETTINGS and k in sh._TWEAK_PARAMS
 
 
 def test_preset_round_trip_with_streak_tuples():
@@ -662,7 +662,7 @@ def test_config_set_writes_disk_and_signals_daemon(monkeypatch):
     assert cfg["max_profit"] == 0.5 and cfg["purge_days"] == 30 and cfg["db_write_mode"] == "sync"
     assert kills == [(4242, signal.SIGHUP)]
     assert "⚠ purge_days clamped" in out and "Daemon reloaded live config" in out
-    assert "need a full restart" in out and "db_write_mode" in out
+    assert "Restart every lane to apply: db_write_mode" in out
 
 
 @pytest.mark.parametrize("pairs", [["bearer_token=x"], ["nosuch=1"], ["noequals"], ["maxloss=abc"]])

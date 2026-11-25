@@ -1,5 +1,24 @@
 # Changelog
 
+## CLI v1.16.0 / shufflectl v1.4 - what a change costs, restarts at a session end, rolling updates (2026-11-25)
+
+Ports WolfBet's restart classes, pending restarts, session-end restarts and rolling update (WolfBet v2.55.0, v2.56.0, v2.58.0 to v2.60.0), the same code as goated 1.17.0 without the events feed (shuffle has none).
+
+### Restart classes
+- Every setting is classed live (a running lane re-reads it), lane (it applies when that lane restarts) or service (shared, every lane restarts). `config-set mult=3` prints `Restart every lane to apply: multiplier_target (shufflectl restart).`; `lane2.loss_mult=3` prints `Restart lane 2 to apply: loss_mult (shufflectl restart 2).`; live changes print no restart line.
+- `db_write_mode` is now a service setting: a running lane no longer reloads it, because the bet writer reads it only at start (the note already asked for a restart).
+
+### What a lane waits on
+- A running lane lists the saved changes it has not picked up: `shufflectl lanes` shows `Lane 2 waits for a restart: multiplier_target 2.0 -> 3.0 (shufflectl restart 2)`. The token is never listed. The state file carries `pending_restart` and `code_version`.
+- The lanes table has a Code column: `new`, `waiting for session end` or `old`.
+
+### Session-end restarts and rolling updates
+- `shufflectl restart K --at-boundary` re-executes lane K in place when its session ends; `--cancel-boundary` drops the request; `shufflectl lane remove K --after-session` removes lane K then. With recurring off the restart is dropped and the lane stops as usual. The request (`~/.shuffle_autobot.drain`, `.laneK`, 0600) is read once per session close, never per bet.
+- `shufflectl update` asks each running lane to restart on the new code at its session end; betting goes on. `shufflectl update --critical` restarts every lane now, as before.
+
+### Tests
+- `tests/test_lane_restarts.py`; `tests/test_shufflectl_lanes.py` (`restart K --at-boundary`, `lane remove K --after-session`, rolling and critical update). Tests that pinned the old restart note, `db_write_mode` as live or the versions updated.
+
 ## CLI v1.15.0 / TG v1.11.0 / shufflectl v1.3 - the token in the vault, a lane on its own account (2026-11-25)
 
 Ports WolfBet's key vault and per-lane accounts (WolfBet v2.51.0 to v2.53.0, v2.57.0), the same code as goated 1.16.0 without the device id (shuffle has none). Needs casino-shared 0.11.0; with an older one the CLI prints `casino-shared 0.11.0 or newer is needed: run shufflectl update` and exits 1.

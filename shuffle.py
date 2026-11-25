@@ -32,6 +32,7 @@ try:
         LANE_ID_MAX, LANE_NAME_HELP, LANE_NAME_RE, default_lane_name, lane_file_ids, lane_ids,
         lane_name, lane_overrides, lane_registry, lanes_max, next_lane_id, registry_block,
         set_enabled_count, split_registry_pairs, account_lanes, lane_account,
+        request_drain, take_drain,
     )
     from shared.core.vault import KEY_ID_RE, Vault, VaultError, check_secret, vault_info, vault_secret
 except ImportError:
@@ -104,8 +105,11 @@ STATE_PATH   = os.path.expanduser("~/.shuffle_autobot_live.json")
 PID_PATH     = os.path.expanduser("~/.shuffle_autobot.pid")
 PRESET_PATH  = os.path.expanduser("~/.shuffle_presets.json")
 RUN_PATH     = os.environ.get("SHUFFLE_RUN_PATH", os.path.expanduser("~/.shuffle_run.json"))
+# A lane's restart or removal request for its next session end (.laneK for lanes 2+).
+DRAIN_PATH   = os.environ.get("SHUFFLE_DRAIN_PATH", os.path.expanduser("~/.shuffle_autobot.drain"))
+SHUFFLECTL   = os.environ.get("SHUFFLE_SHUFFLECTL", os.path.expanduser("~/.local/bin/shufflectl"))
 LOG_DIR      = os.path.expanduser("~/.shuffle_logs")
-VERSION      = "1.15.0"
+VERSION      = "1.16.0"
 MIN_BET      = 0.001   # Shuffle minimum bet
 APP_ENV      = os.environ.get("APP_ENV", "production")
 
@@ -127,12 +131,42 @@ logger.addHandler(_log_handler)
 # 2..N get `.laneK` state / pid files. Config file, DB and log file are shared.
 _BASE_STATE_PATH, _BASE_PID_PATH = STATE_PATH, PID_PATH
 
-# Keys that can't differ per lane: the token itself (a lane names a vault key with key_ref),
-# the game and the storage settings. A lane may bet from its own account: key_ref,
+# Every setting: how a change reaches running lanes, and whether one lane may override it.
+#   live    - a running lane re-reads it on SIGHUP
+#   lane    - the lane picks it up when it restarts
+#   service - shared by every lane, read at start: every lane must restart
+# The token itself, the game and the storage settings are shared (the bet writer reads
+# db_write_mode only at start); a lane may bet from its own account through key_ref,
 # currency and proxy / proxy_ref.
-_LANE_FORBIDDEN_KEYS = frozenset({
-    "bearer_token", "game", "purge_days", "db_write_mode",
-})
+_LIVE_PER_LANE = (
+    "base_bet", "basebet_pct", "bet_delay", "custom_rules_text",
+    "max_profit", "max_loss", "max_bets", "max_wins", "stop_on_balance",
+    "milestone_bets", "milestone_wins", "milestone_losses", "milestone_profit",
+    "profit_increment", "profit_threshold", "recurring", "recurring_delay",
+    "streak_reset_losses", "streak_reset_delay",
+    "streak_delay_loss", "streak_delay_win", "streak_delay_bets", "streakbet_loss",
+    "proxy",
+)
+_LANE_RESTART = (
+    "currency", "multiplier_target", "dice_target", "dice_condition",
+    "strategy", "strategy_key", "win_mult", "loss_mult", "delay_martin_threshold",
+    "profit_increment_scope", "key_ref", "proxy_ref",
+)
+_SETTINGS = {
+    **{k: ("live", True) for k in _LIVE_PER_LANE},
+    "purge_days": ("live", False),
+    **{k: ("lane", True) for k in _LANE_RESTART},
+    **{k: ("service", False) for k in ("bearer_token", "game", "db_write_mode")},
+}
+_LIVE_RELOAD_KEYS = frozenset(k for k, (apply, _) in _SETTINGS.items() if apply == "live")
+_LANE_FORBIDDEN_KEYS = frozenset(k for k, (_, per_lane) in _SETTINGS.items() if not per_lane)
+# Never listed as waiting for a restart: what identifies the account.
+_PENDING_HIDDEN = frozenset({"bearer_token"})
+
+
+def _restart_only(keys) -> list:
+    """The keys among `keys` that a running lane picks up only when it restarts."""
+    return sorted(k for k in set(keys) if k in _SETTINGS and k not in _LIVE_RELOAD_KEYS)
 
 # The host key vault: shuffle's main token is `default`, the Telegram bot token `telegram`.
 VAULT_SERVICE = "shuffle"
@@ -627,22 +661,6 @@ _PRESET_KEYS = [
     "proxy", "purge_days", "db_write_mode",
 ]
 
-# v1.7.0: fields re-read into a running bot on SIGHUP (WolfBet v2.28.3) without
-# touching the session identity, counters or the Martingale ladder. Anything else
-# needs a restart.
-_LIVE_RELOAD_KEYS = {
-    "recurring", "recurring_delay", "streak_reset_losses", "streak_reset_delay",
-    "max_profit", "max_loss", "max_bets", "max_wins", "stop_on_balance",
-    "bet_delay", "basebet_pct", "base_bet",
-    "streak_delay_loss", "streak_delay_win", "streak_delay_bets", "streakbet_loss",
-    "milestone_bets", "milestone_wins", "milestone_losses", "milestone_profit",
-    "profit_increment", "profit_threshold",
-    "custom_rules_text",
-    # v1.9.0: proxy is re-applied to the live HTTP session; db_write_mode only
-    # takes effect for the writer thread on the next start.
-    "proxy", "purge_days", "db_write_mode",
-}
-
 
 def _reload_live_config() -> dict:
     """Re-read CONFIG_PATH and apply only live-safe fields; return {field: (old, new)}."""
@@ -701,6 +719,8 @@ def _reload_live_config() -> dict:
         elif state.run_first_session is None and state.session_id:
             _attach_run(state.session_id)
             state.next_profit_milestone = state.profit_threshold
+    state.pending_restart = {k: [getattr(state, k, None), data[k]] for k in sorted(skipped)
+                             if k in _SETTINGS and k not in _PENDING_HIDDEN}
     if skipped:
         logger.warning("live reload: skipped %d unsafe field(s): restart to apply: %s",
                        len(skipped), ", ".join(sorted(skipped)))
@@ -1288,6 +1308,7 @@ class BotState:
         self.key_ref         : str = "default"
         self.proxy_ref       : Optional[str] = None
         self.account_problem : Optional[str] = None
+        self.pending_restart : dict = {}   # saved restart-only changes: {key: [running, saved]}
         self.lane_split      : str = "none"
         self.lane_share      : Optional[float] = None   # None = no lane budget
         self.lane_run_profit : float = 0.0               # closed cycles of this run
@@ -2222,6 +2243,10 @@ def betting_loop():
             if should_restart(reason, state.profit, state.recurring, state.streak_reset_losses):
                 logger.info("RECURRING RESTART after: %s", reason)
                 _db_save_session()
+                if _session_boundary(final=False):
+                    state.running = False
+                    state.status = f"STOPPED: {reason}"
+                    break
                 _reset_session_for_recurring(
                     restart_delay_for(reason, state.recurring_delay, state.streak_reset_delay))
                 last_result = "none"
@@ -2229,6 +2254,7 @@ def betting_loop():
             state.running = False
             state.status  = f"STOPPED: {reason}"
             _db_save_session()
+            _session_boundary(final=True)
             break
 
         sd = streak_delay_for(state.current_streak, state.total_bets,
@@ -2836,6 +2862,8 @@ def _save_state_file():
             # v1.10.0 lanes (WolfBet v2.35.0 / v2.36.0)
             "lane": state.lane,
             "lanes_count": state.lanes_count,
+            "pending_restart": state.pending_restart,
+            "code_version": VERSION,
             "lane_split": state.lane_split,
             "lane_share": state.lane_share,
             "lane_equity": _lane_equity(),
@@ -6015,7 +6043,7 @@ def _cmd_config_set_lanes(per_lane: dict, block: dict) -> None:
     reg = lane_registry(raw)
     next_id = next_lane_id(raw, reg)
     count, split, limit = block.get("count"), block.get("split"), block.get("max")
-    lines = []
+    lines, restart_notes = [], {}
     effective_limit = limit if limit is not None else lanes_max(raw)
     if limit is not None:
         lines.append(f"  [yellow]lanes_max[/]: [dim]{lanes_max(raw)}[/]  →  [green]{limit}[/]")
@@ -6056,6 +6084,7 @@ def _cmd_config_set_lanes(per_lane: dict, block: dict) -> None:
             console.print(f"[red]Invalid lane{lane} override:[/] {e}")
             sys.exit(2)
         ov = entry["overrides"]
+        restart_notes[lane] = _restart_only(list(changes) + list(removals))
         for key in removals:
             if ov.pop(key, None) is not None:
                 lines.append(f"  [yellow]lane{lane}.{key}[/]: override removed (uses base)")
@@ -6067,6 +6096,10 @@ def _cmd_config_set_lanes(per_lane: dict, block: dict) -> None:
     for line in lines:
         console.print(line)
     console.print(f"\n[dim]Saved to[/] [cyan]{CONFIG_PATH}[/]")
+    for lane, keys in sorted(restart_notes.items()):
+        if keys:
+            console.print(f"[yellow]Restart lane {lane} to apply:[/] {', '.join(keys)} "
+                          f"[dim](shufflectl restart {lane}).[/]")
     if per_lane:
         n = _signal_lane_daemons(sorted(per_lane))
         if n:
@@ -6110,6 +6143,60 @@ def cmd_lane_add(name: str, src=None) -> int:
     console.print(f"Lane {lane} ({escape(name)}) added{copied}.")
     _signal_share_change(before, raw)
     return 0
+
+
+def cmd_lane_drain(lane: int, action: str) -> int:
+    """Ask lane `lane` to restart or be removed when its current session ends, or cancel that."""
+    if action == "remove" and lane == 1:
+        console.print("[red]Lane 1 holds the base config and can't be removed.[/]")
+        return 2
+    raw = _read_config_raw()
+    if not raw:
+        console.print("[yellow]No config saved yet: run the wizard first.[/]")
+        return 1
+    if lane not in lane_registry(raw):
+        console.print(f"[red]No lane {lane}.[/]")
+        return 2
+    request_drain(DRAIN_PATH, lane, action)
+    if action == "cancel":
+        console.print(f"Lane {lane} no longer waits for its session end.")
+        return 0
+    done = "restarts" if action == "restart" else "is removed"
+    console.print(f"Lane {lane} {done} when its session ends. It keeps betting until then.")
+    return 0
+
+
+def _session_boundary(final: bool) -> bool:
+    """Carry out a restart or removal the lane was asked to do at its session end.
+
+    Read once per session close, never per bet. The request is deleted before it is acted
+    on, so a lane that fails to come back never loops on it. A restart re-executes this
+    process on the saved config and code; with `final` (recurring off) the lane stops as
+    usual and the restart is dropped. Returns True when the lane must stop now.
+    """
+    try:
+        action = take_drain(DRAIN_PATH, state.lane)
+    except OSError as e:
+        logger.warning("Lane %d: session-end request unreadable: %s", state.lane, e)
+        return False
+    if action == "remove":
+        logger.warning("Lane %d: removed at the session boundary", state.lane)
+        import subprocess
+        with open(os.devnull, "wb") as null:
+            subprocess.Popen([SHUFFLECTL, "lane", "remove", str(state.lane)],
+                             stdout=null, stderr=null, start_new_session=True)
+        return True
+    if action != "restart":
+        return False
+    if final:
+        logger.info("Lane %d: restart request dropped, the lane stops at its session end",
+                    state.lane)
+        return False
+    logger.warning("Lane %d: restarting at the session boundary", state.lane)
+    _stop_bet_writer(timeout=5.0)
+    _save_state_file()
+    os.execv(sys.executable, [sys.executable] + sys.argv)
+    return True
 
 
 def cmd_lane_remove(lane: int) -> int:
@@ -6169,14 +6256,14 @@ def cmd_lanes_status():
              if entry["name"] != default_lane_name(lane)}
     t = Table(title="Parallel lanes", title_style="bold cyan", box=box.SIMPLE)
     cols = ("Lane",) + (("Name",) if names else ()) + (
-        "State", "Session", "Uptime", "Run", "Profit", "Equity", "bps")
+        "State", "Session", "Uptime", "Run", "Profit", "Equity", "bps", "Code")
     for col in cols:
         t.add_column(col, justify="left" if col in ("Name", "State") else "right")
     tot_bps = tot_profit = 0.0
     for k, d, alive in rows:
         lead = (str(k), escape(names.get(k, ""))) if names else (str(k),)
         if d is None:
-            t.add_row(*lead, "[red]unreadable[/]", *["-"] * 6)
+            t.add_row(*lead, "[red]unreadable[/]", *["-"] * 7)
             continue
         p = float(d.get("profit", 0) or 0)
         bps = float(d.get("bets_per_second", 0) or 0) if alive else 0.0
@@ -6192,11 +6279,33 @@ def cmd_lanes_status():
                   fmt_duration(run) if run is not None else "-",
                   f"[{'green' if p >= 0 else 'red'}]{p:+.8f}[/]",
                   f"{eq:.8f}" if isinstance(eq, (int, float)) else "-",
-                  f"{bps:.1f}")
+                  f"{bps:.1f}", _lane_code(k, d) if alive else "-")
     console.print(t)
     console.print(f"  [dim]Total:[/] [bold]{tot_bps:.1f}[/] bps   "
                   f"[dim]session P/L[/] [{'green' if tot_profit >= 0 else 'red'}]{tot_profit:+.8f}[/]   "
                   f"[dim]lanes live[/] {sum(1 for _, _, a in rows if a)}/{len(rows)}")
+    for k, d, alive in rows:
+        pending = (d or {}).get("pending_restart") if alive else None
+        if isinstance(pending, dict) and pending:
+            parts = ", ".join(f"{key} {_fmt_config_value(key, v[0])} -> {_fmt_config_value(key, v[1])}"
+                              for key, v in sorted(pending.items())
+                              if isinstance(v, list) and len(v) == 2)
+            console.print(f"  [yellow]Lane {k} waits for a restart:[/] {parts} "
+                          f"[dim](shufflectl restart {k})[/]")
+
+
+def _lane_code(lane: int, d: Optional[dict]) -> str:
+    """Which code a lane runs during an update: `new` (this installed version), `waiting for
+    session end` (old code, a restart asked for), or `old`."""
+    if d and d.get("code_version") == VERSION:
+        return "new"
+    try:
+        with open(lane_path(DRAIN_PATH, lane)) as f:
+            if f.read().strip() == "restart":
+                return "waiting for session end"
+    except OSError:
+        pass
+    return "old"
 
 
 def _parse_config_set_pairs(pairs: list) -> dict:
@@ -6315,11 +6424,10 @@ def _config_set_write(pairs: list):
             console.print(f"  [yellow]{m}[/]")
     console.print(f"\n[dim]Saved to[/] [cyan]{CONFIG_PATH}[/]")
 
-    unsafe = sorted(k for k in parsed
-                    if k not in _LIVE_RELOAD_KEYS or k == "db_write_mode")
+    unsafe = _restart_only(parsed)
     if unsafe:
-        console.print(f"[yellow]Note:[/] {len(unsafe)} field(s) need a full restart to apply: "
-                      f"{', '.join(unsafe)}. Run [cyan]shufflectl restart[/] when ready.")
+        console.print(f"[yellow]Restart every lane to apply:[/] {', '.join(unsafe)} "
+                      "[dim](shufflectl restart).[/]")
     try:
         if not os.path.exists(PID_PATH):
             console.print("[dim]Daemon not running; changes apply on next start.[/]")
@@ -6706,6 +6814,8 @@ def main():
                        help="Add one lane named NAME; the other lanes keep betting")
     group.add_argument("--lane-remove", type=int, metavar="K",
                        help="Remove lane K from the registry (lane 1 can't be removed)")
+    group.add_argument("--lane-drain", nargs=2, metavar=("K", "ACTION"),
+                       help="At lane K's session end: restart, remove, or cancel a request")
     group.add_argument("--key-list", action="store_true", help="List the vault keys (no secrets)")
     group.add_argument("--key-put", metavar="ID", help="Add vault key ID; the secret is read from stdin")
     group.add_argument("--key-rotate", metavar="ID", help="Replace vault key ID; the secret is read from stdin")
@@ -6807,6 +6917,12 @@ def main():
         sys.exit(cmd_lane_add(args.lane_add, args.lane_from))
     if args.lane_remove is not None:
         sys.exit(cmd_lane_remove(args.lane_remove))
+    if args.lane_drain is not None:
+        k, action = args.lane_drain
+        if not k.isdigit() or action not in ("restart", "remove", "cancel"):
+            console.print("[red]Usage: --lane-drain K restart|remove|cancel[/]")
+            sys.exit(2)
+        sys.exit(cmd_lane_drain(int(k), action))
     if args.key_list:
         sys.exit(cmd_key("list"))
     for action, key_id in (("put", args.key_put), ("rotate", args.key_rotate),
