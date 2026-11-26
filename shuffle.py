@@ -109,7 +109,7 @@ RUN_PATH     = os.environ.get("SHUFFLE_RUN_PATH", os.path.expanduser("~/.shuffle
 DRAIN_PATH   = os.environ.get("SHUFFLE_DRAIN_PATH", os.path.expanduser("~/.shuffle_autobot.drain"))
 SHUFFLECTL   = os.environ.get("SHUFFLE_SHUFFLECTL", os.path.expanduser("~/.local/bin/shufflectl"))
 LOG_DIR      = os.path.expanduser("~/.shuffle_logs")
-VERSION      = "1.17.0"
+VERSION      = "1.18.0"
 MIN_BET      = 0.001   # Shuffle minimum bet
 APP_ENV      = os.environ.get("APP_ENV", "production")
 
@@ -415,6 +415,11 @@ def init_db():
         except sqlite3.OperationalError:
             pass
     ensure_sessions_lane(c)   # v1.8.0: sessions.lane (WolfBet v2.35.0); old rows = lane 1
+    # The vault key each session bet with; rows from before it read NULL (the main key).
+    try:
+        c.execute("ALTER TABLE sessions ADD COLUMN key_ref TEXT")
+    except sqlite3.OperationalError:
+        pass
     conn.commit()
     conn.close()
 
@@ -2401,12 +2406,13 @@ def _db_start_session() -> int:
     c = conn.cursor()
     c.execute("""
         INSERT INTO sessions
-            (started_at, currency, game, strategy, base_bet, multiplier, start_balance, lane)
-        VALUES (?,?,?,?,?,?,?,?)
+            (started_at, currency, game, strategy, base_bet, multiplier, start_balance, lane, key_ref)
+        VALUES (?,?,?,?,?,?,?,?,?)
     """, (
         datetime.now().isoformat(),
         state.currency, state.game, state.strategy,
         state.base_bet, state.multiplier_target, state.start_balance, state.lane,
+        state.key_ref or VAULT_KEY_ID,
     ))
     conn.commit()
     sid = c.lastrowid
@@ -2862,6 +2868,7 @@ def _save_state_file():
             # v1.10.0 lanes (WolfBet v2.35.0 / v2.36.0)
             "lane": state.lane,
             "lanes_count": state.lanes_count,
+            "key_ref": state.key_ref,
             "pending_restart": state.pending_restart,
             "code_version": VERSION,
             "lane_split": state.lane_split,
