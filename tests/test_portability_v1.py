@@ -48,7 +48,7 @@ def _mk_engine(db):
 
 # ── VERSION ───────────────────────────────────────────────
 def test_cli_version():
-    assert sh.VERSION == "1.18.0"
+    assert sh.VERSION == "1.19.0"
 
 
 def test_tg_version():
@@ -293,7 +293,7 @@ def test_argparse_since_until_on_standalone_parser():
     for line in src.splitlines():
         if "--since" in line or "--until" in line:
             assert line.strip().startswith("parser.add_argument")
-    assert 'cmd_stats(since=args.since, until=args.until, lane=args.lane)' in src
+    assert 'cmd_stats(since=args.since, until=args.until, lane=args.lane, as_json=args.json,' in src
 
 
 def test_tg_analytics_supports_date_window():

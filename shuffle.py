@@ -109,7 +109,7 @@ RUN_PATH     = os.environ.get("SHUFFLE_RUN_PATH", os.path.expanduser("~/.shuffle
 DRAIN_PATH   = os.environ.get("SHUFFLE_DRAIN_PATH", os.path.expanduser("~/.shuffle_autobot.drain"))
 SHUFFLECTL   = os.environ.get("SHUFFLE_SHUFFLECTL", os.path.expanduser("~/.local/bin/shufflectl"))
 LOG_DIR      = os.path.expanduser("~/.shuffle_logs")
-VERSION      = "1.18.0"
+VERSION      = "1.19.0"
 MIN_BET      = 0.001   # Shuffle minimum bet
 APP_ENV      = os.environ.get("APP_ENV", "production")
 
@@ -4630,8 +4630,12 @@ def cmd_export(path: str, session_id: Optional[int] = None) -> int:
 # ===========================================================
 #  CLI COMMANDS
 # ===========================================================
-def cmd_stats(since: str = None, until: str = None, lane: int = None):
+def cmd_stats(since: str = None, until: str = None, lane: int = None, as_json: bool = False,
+              before: int = None):
     """Show session statistics, optionally filtered to a date window and lane."""
+    if as_json:
+        _stats_json(since, until, lane, before)
+        return
     if not os.path.exists(DB_PATH):
         console.print("[yellow]No database found.[/]")
         return
@@ -6254,9 +6258,73 @@ def _read_lane_states() -> list:
     return out
 
 
-def cmd_lanes_status():
+# The JSON reads Telegram lists lanes and sessions from: one document per call, in WolfBet's
+# shape (a subset of its fields), with a stable error code instead of a Rich message.
+CLI_JSON_VERSION = 1
+
+
+def _print_json(doc: dict) -> None:
+    """Write one JSON document to stdout. Under --json it is the only stdout output."""
+    sys.stdout.write(json.dumps({"v": CLI_JSON_VERSION, **doc}, default=str) + "\n")
+    sys.stdout.flush()
+
+
+def _json_error(code: str, message: str) -> None:
+    _print_json({"error": {"code": code, "message": message}})
+
+
+def _lanes_status_json() -> None:
+    """Every registry lane's state file (None when it never ran or can't be read) and whether
+    it runs or pauses."""
+    lanes = []
+    for k, d, alive in _read_lane_states():
+        paused = bool(alive and d is not None and int(d.get("pause_remaining_sec", 0) or 0) > 0)
+        lanes.append({"lane": k, "alive": alive, "paused": paused, "state": d})
+    _print_json({"lanes": lanes})
+
+
+_STATS_JSON_COLS = ("id", "lane", "started_at", "ended_at", "total_bets", "wins", "losses",
+                    "wagered", "profit", "currency", "start_balance", "end_balance",
+                    "strategy", "multiplier", "base_bet")
+
+
+def _stats_json(since: str = None, until: str = None, lane: int = None, before: int = None) -> None:
+    """Recent sessions (20, or 50 for a date range), newest first; `before` keeps only sessions
+    older than that id, so a caller can page back."""
+    if not os.path.exists(DB_PATH):
+        _json_error("no_database", "No database found.")
+        return
+    init_db()
+    try:
+        if lane is not None and not 1 <= int(lane) <= LANE_ID_MAX:
+            raise ValueError(f"--lane must be 1-{LANE_ID_MAX}, got {lane}")
+        where, params, _ = stats_date_window(since, until, lane)
+    except ValueError as e:
+        _json_error("invalid_window", str(e))
+        return
+    if before is not None:
+        where = f"{where} AND id < ?" if where else " WHERE id < ?"
+        params = [*params, int(before)]
+    limit = 50 if (since or until) else 20
+    conn = _db_conn()
+    try:
+        rows = conn.execute(f"""
+            SELECT id, COALESCE(lane, 1), started_at, ended_at, total_bets, wins, losses,
+                   wagered, profit, UPPER(currency), start_balance, end_balance,
+                   strategy, multiplier, base_bet
+            FROM sessions{where} ORDER BY id DESC LIMIT ?
+        """, (*params, limit)).fetchall()
+    finally:
+        conn.close()
+    _print_json({"sessions": [dict(zip(_STATS_JSON_COLS, r)) for r in rows]})
+
+
+def cmd_lanes_status(as_json: bool = False):
     """One row per lane + totals (shufflectl status / lanes). No Pace column: shuffle has no
     soft pacing (no rate-limit quota headers)."""
+    if as_json:
+        _lanes_status_json()
+        return
     rows = _read_lane_states()
     if not rows:
         console.print("[yellow]No lane state files found.[/]")
@@ -6861,6 +6929,10 @@ def main():
                         help="Parallel lane to run or inspect (1-99, default 1): own state / pid "
                              "files and [LK] log prefix; with --stats/--analytics only that "
                              "lane's sessions")
+    parser.add_argument("--json", action="store_true",
+                        help="With --stats or --lanes-status: print one JSON document to stdout")
+    parser.add_argument("--before", type=int, metavar="ID",
+                        help="With --stats --json: only sessions older than #ID (page back)")
     parser.add_argument("--key-label", metavar="LABEL", help="With --key-put: a label (default: the id)")
     parser.add_argument("--key-kind", choices=("key", "proxy", "telegram"), default="key",
                         help="With --key-put: what the entry holds (default: key)")
@@ -6887,6 +6959,15 @@ def main():
                         help="Enable debug logging (dev mode)")
 
     args = parser.parse_args()
+
+    if args.json and not (args.stats or args.lanes_status):
+        sys.stderr.write("--json works with --stats and --lanes-status\n")
+        sys.exit(2)
+    if args.before is not None and not (args.stats and args.json):
+        sys.stderr.write("--before works with --stats --json\n")
+        sys.exit(2)
+    if args.json:
+        console.file = sys.stderr   # stdout carries only the JSON document
 
     # v1.10.0: pick the lane before any command so --status / --stop / --monitor /
     # --diagnose act on that lane's files.
@@ -6917,7 +6998,7 @@ def main():
         cmd_run_reset(args.lane)
         return
     if args.lanes_status:
-        cmd_lanes_status()
+        cmd_lanes_status(as_json=args.json)
         return
     if args.lane_ids:
         reg = lane_registry(_read_config_raw())
@@ -6959,7 +7040,8 @@ def main():
         cmd_cleanup(None if args.cleanup == -1 else args.cleanup)
         return
     if args.stats:
-        cmd_stats(since=args.since, until=args.until, lane=args.lane)
+        cmd_stats(since=args.since, until=args.until, lane=args.lane, as_json=args.json,
+                  before=args.before)
         return
     if args.analytics:
         cmd_analytics(since=args.since, until=args.until, lane=args.lane)

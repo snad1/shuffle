@@ -151,6 +151,8 @@ shufflectl presets        # List saved presets
 shufflectl update         # Update bot from current directory; each lane restarts on the new code at its session end
 shufflectl update --critical   # Same, but restart every lane now
 shufflectl lanes [N] [--split none|budget|bet|both] [--max N]  # Show or set parallel lanes; only the difference starts or stops
+shufflectl lanes --json                                        # Every lane's state as one JSON document (Telegram reads it)
+shufflectl stats --json [--lane K] [--before ID]               # Recent sessions as JSON, older than #ID when given
 shufflectl lane add NAME [--from K] | remove K | rename K NAME  # Change one lane; the others keep betting
 shufflectl start|stop|restart K   # One lane alone (lane 1 is the shuffle service)
 shufflectl restart K --at-boundary   # Restart lane K when its session ends (--cancel-boundary drops it); lane remove K --after-session removes it then

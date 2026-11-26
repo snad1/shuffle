@@ -215,7 +215,7 @@ def test_cli_analytics_and_lane_dispatch(monkeypatch):
     monkeypatch.setattr(sh.sys, "argv", ["shuffle.py", "--stats", "--lane", "3"])
     sh.main()
     assert calls == [("a", {"since": "2026-11-13 14:00", "until": None, "lane": 2}),
-                     ("s", {"since": None, "until": None, "lane": 3})]
+                     ("s", {"since": None, "until": None, "lane": 3, "as_json": False, "before": None})]
 
 
 def test_cli_lane_out_of_range_exits(monkeypatch):
