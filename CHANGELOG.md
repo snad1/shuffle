@@ -1,5 +1,12 @@
 # Changelog
 
+## CLI v1.17.0 / shufflectl v1.6 - every lane visible and started with the bot, rolling restart (2026-11-26)
+
+- `shufflectl lanes` lists a registry lane that never ran (no state file yet) as `NOT RUNNING`, so a lane that should bet but doesn't is still seen; a broken state file still reads `unreadable`.
+- `shufflectl start 1` and `restart 1` also start the enabled lanes that are not running; running lanes are left alone, and `stop 1` touches no other lane.
+- `shufflectl restart --rolling` asks every running lane to restart on its saved config at its own session end; a stopped lane is named with `start it with: shufflectl start K`, and with the bot down it says to start it (exit 1). No unit restarts now.
+- `shufflectl update` output is unchanged.
+
 ## shufflectl v1.5 - removed lanes leave nothing behind (2026-11-26)
 
 - `shufflectl lane remove K` deletes lane K's state, pid, run and session-end files once its unit stops. Its history stays in the database, and a remove the bot refuses keeps them.

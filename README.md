@@ -154,6 +154,7 @@ shufflectl lanes [N] [--split none|budget|bet|both] [--max N]  # Show or set par
 shufflectl lane add NAME [--from K] | remove K | rename K NAME  # Change one lane; the others keep betting
 shufflectl start|stop|restart K   # One lane alone (lane 1 is the shuffle service)
 shufflectl restart K --at-boundary   # Restart lane K when its session ends (--cancel-boundary drops it); lane remove K --after-session removes it then
+shufflectl restart --rolling         # Restart every running lane at its own session end; starting or restarting lane 1 also starts the enabled lanes that are not running
 shufflectl key list | add ID [--label L] [--kind key|proxy|telegram] | rotate ID | delete ID  # Vault tokens, proxies, Telegram token (hidden prompt)
 shufflectl config-set lane3.key_ref=friend-a lane3.currency=trx lane3.proxy_ref=friend-px  # Lane 3 on a friend's account; only lane 3 restarts
 shufflectl diagnose         # Bottleneck analysis of the running session
